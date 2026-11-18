@@ -1,0 +1,10 @@
+# Build caches
+/target/
+*.cubin
+*.log
+apexprl_tune.json
+
+# Local operator launch scripts with personal wallet addresses
+/start_mining_kryptex.bat
+/*.local.bat
+/*.local.sh

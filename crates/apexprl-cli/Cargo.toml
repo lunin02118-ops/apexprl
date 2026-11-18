@@ -1,0 +1,21 @@
+[package]
+name = "apexprl-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apexprl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+apexprl-gpu = { path = "../apexprl-gpu" }
+apexprl-pow = { path = "../apexprl-pow" }
+apexprl-stratum = { path = "../apexprl-stratum" }
+clap.workspace = true
+crossbeam-channel.workspace = true
+libc.workspace = true
+primitive-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true

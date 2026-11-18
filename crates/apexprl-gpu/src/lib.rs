@@ -1,0 +1,811 @@
+//! Multi-GPU CUDA Driver API & NVML engine for ApexPRL (RTX 40 `sm_89` + RTX 50 `sm_120a`).
+
+pub mod cuda_drv;
+pub mod nvml_drv;
+
+use anyhow::{bail, ensure, Context, Result};
+use apexprl_pow::{Constant64MerkleCache, KernelProfile, PreparedJob};
+use cuda_drv::*;
+use nvml_drv::{GpuSensors, NvmlHandle};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::ffi::{c_int, c_uint, c_void, CStr, CString};
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+const CUBIN_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_sm89.cubin"));
+const CUBIN_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_sm120a.cubin"));
+
+pub const SMEM_CARVEOUT_BYTES: c_int = 96320;
+pub const VARIANT_NAMES_ADA: [&str; 4] = ["ada-u6", "ada-y5m1", "ada-u10", "ada-early"];
+pub const VARIANT_NAMES_BW: [&str; 4] = ["bw-u6", "bw-y5m1", "bw-w5q21", "bw-u10"];
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ApxBasisParams {
+    bas_a: CUdeviceptr,
+    bas_b: CUdeviceptr,
+    pairs: CUdeviceptr,
+    sampled_m: i32,
+    n: i32,
+    k: i32,
+    key_a: CUdeviceptr,
+    target_le: CUdeviceptr,
+    hit_count: CUdeviceptr,
+    hit_groups: CUdeviceptr,
+    hit_cap: i32,
+    abort_epoch_ptr: CUdeviceptr,
+    expected_epoch: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<ApxBasisParams>() == 96);
+
+#[derive(Clone, Debug)]
+pub struct GpuDeviceInfo {
+    pub ordinal: usize,
+    pub name: String,
+    pub sm_major: i32,
+    pub sm_minor: i32,
+    pub sm_count: i32,
+    pub l2_bytes: usize,
+    pub vram_total_mib: usize,
+    pub pci_bus_id: u32,
+}
+
+impl GpuDeviceInfo {
+    pub fn is_blackwell(&self) -> bool {
+        self.sm_major == 12
+    }
+    pub fn is_ada_or_ampere(&self) -> bool {
+        self.sm_major == 8 && self.sm_minor >= 9
+    }
+    pub fn is_supported(&self) -> bool {
+        self.is_blackwell() || self.is_ada_or_ampere()
+    }
+    /// Estimated peak INT8 MACs/sec at ~2500 MHz for Kryptex auto-difficulty sizing.
+    pub fn estimated_macs_per_sec(&self) -> f64 {
+        (self.sm_count as f64) * 1024.0 * 2.5e9
+    }
+}
+
+pub fn enumerate_gpus() -> Result<Vec<GpuDeviceInfo>> {
+    let api = cuda()?;
+    let mut count = 0;
+    check_cu(api, unsafe { (api.cuDeviceGetCount)(&mut count) }, "cuDeviceGetCount")?;
+    let mut out = Vec::with_capacity(count.max(0) as usize);
+    for ord in 0..count {
+        let mut dev = 0;
+        check_cu(api, unsafe { (api.cuDeviceGet)(&mut dev, ord) }, "cuDeviceGet")?;
+        let mut raw_name = [0i8; 128];
+        check_cu(api, unsafe { (api.cuDeviceGetName)(raw_name.as_mut_ptr(), 128, dev) }, "cuDeviceGetName")?;
+        let name = unsafe { CStr::from_ptr(raw_name.as_ptr()) }.to_string_lossy().into_owned();
+
+        let attr = |a: c_int| -> Result<i32> {
+            let mut v = 0;
+            check_cu(api, unsafe { (api.cuDeviceGetAttribute)(&mut v, a, dev) }, "cuDeviceGetAttribute")?;
+            Ok(v)
+        };
+        let sm_major = attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+        let sm_minor = attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let sm_count = attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
+        let l2_bytes = attr(CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE).unwrap_or(0).max(0) as usize;
+        let pci_bus_id = attr(CU_DEVICE_ATTRIBUTE_PCI_BUS_ID).unwrap_or(0).max(0) as u32;
+
+        // Retain context briefly to query total memory
+        let mut ctx = std::ptr::null_mut();
+        let mut vram_total_mib = 0;
+        if unsafe { (api.cuDevicePrimaryCtxRetain)(&mut ctx, dev) } == 0 {
+            let _ = unsafe { (api.cuCtxSetCurrent)(ctx) };
+            let (mut free_b, mut total_b) = (0usize, 0usize);
+            if unsafe { (api.cuMemGetInfo_v2)(&mut free_b, &mut total_b) } == 0 {
+                let _ = free_b;
+                vram_total_mib = total_b / (1024 * 1024);
+            }
+        }
+
+        out.push(GpuDeviceInfo {
+            ordinal: ord as usize,
+            name,
+            sm_major,
+            sm_minor,
+            sm_count,
+            l2_bytes,
+            vram_total_mib,
+            pci_bus_id,
+        });
+    }
+    Ok(out)
+}
+
+struct DevMem {
+    ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+impl DevMem {
+    fn alloc(api: &CudaApi, bytes: usize) -> Result<Self> {
+        let mut ptr = 0u64;
+        check_cu(api, unsafe { (api.cuMemAlloc_v2)(&mut ptr, bytes) }, "cuMemAlloc")?;
+        Ok(Self { ptr, bytes })
+    }
+}
+
+impl Drop for DevMem {
+    fn drop(&mut self) {
+        if let Ok(api) = cuda() {
+            unsafe { let _ = (api.cuMemFree_v2)(self.ptr); }
+        }
+    }
+}
+
+/// Pinned + device-mapped zero-copy page holding `abort_epoch` and `HitRing`.
+pub struct MappedControlPage {
+    host_ptr: *mut u8,
+    pub dev_ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+unsafe impl Send for MappedControlPage {}
+unsafe impl Sync for MappedControlPage {}
+
+impl MappedControlPage {
+    fn alloc(api: &CudaApi, hit_cap: usize) -> Result<Self> {
+        // Layout:
+        // [0..4]:   abort_epoch (AtomicU32, read by GPU CTAs via ld.global.cg.u32)
+        // [64..68]: hit_count (u32)
+        // [68..]:   hit_groups[hit_cap] (u32)
+        let bytes = (68 + hit_cap * 4 + 255) & !255;
+        let mut host_void = std::ptr::null_mut();
+        check_cu(
+            api,
+            unsafe { (api.cuMemHostAlloc)(&mut host_void, bytes, CU_MEMHOSTALLOC_DEVICEMAP) },
+            "cuMemHostAlloc(DEVICEMAP)",
+        )?;
+        unsafe { std::ptr::write_bytes(host_void as *mut u8, 0, bytes) };
+        let mut dev_ptr = 0u64;
+        check_cu(
+            api,
+            unsafe { (api.cuMemHostGetDevicePointer_v2)(&mut dev_ptr, host_void, 0) },
+            "cuMemHostGetDevicePointer",
+        )?;
+        Ok(Self {
+            host_ptr: host_void as *mut u8,
+            dev_ptr,
+            bytes,
+        })
+    }
+
+    #[inline]
+    pub fn epoch_atomic(&self) -> &AtomicU32 {
+        unsafe { &*(self.host_ptr as *const AtomicU32) }
+    }
+
+    #[inline]
+    pub fn epoch_ptr_raw(&self) -> *const AtomicU32 {
+        self.host_ptr as *const AtomicU32
+    }
+
+    #[inline]
+    pub fn dev_abort_ptr(&self) -> CUdeviceptr {
+        self.dev_ptr
+    }
+
+    #[inline]
+    pub fn dev_hit_count_ptr(&self) -> CUdeviceptr {
+        self.dev_ptr + 64
+    }
+
+    #[inline]
+    pub fn dev_hit_groups_ptr(&self) -> CUdeviceptr {
+        self.dev_ptr + 68
+    }
+
+    pub fn read_hits(&self, hit_cap: usize) -> (u32, Vec<u32>) {
+        unsafe {
+            let count = std::ptr::read_volatile((self.host_ptr.add(64)) as *const u32);
+            let n = (count as usize).min(hit_cap);
+            let groups_ptr = (self.host_ptr.add(68)) as *const u32;
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(std::ptr::read_volatile(groups_ptr.add(i)));
+            }
+            (count, out)
+        }
+    }
+}
+
+impl Drop for MappedControlPage {
+    fn drop(&mut self) {
+        let _ = self.bytes;
+        if let Ok(api) = cuda() {
+            unsafe { let _ = (api.cuMemFreeHost)(self.host_ptr as *mut c_void); }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TuneCacheFile {
+    pub entries: HashMap<String, usize>,
+}
+
+impl TuneCacheFile {
+    pub fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(txt) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, txt);
+        }
+    }
+}
+
+pub struct RoundOutcome {
+    pub round_ms: f32,
+    pub kernel_ms: f32,
+    pub total_hits: u32,
+    pub hit_groups: Vec<u32>,
+    pub aborted: bool,
+}
+
+pub struct GpuWorkerEngine {
+    pub info: GpuDeviceInfo,
+    pub profile: KernelProfile,
+    pub active_variant: usize,
+    pub nvml: Option<NvmlHandle>,
+    ctx: CUcontext,
+    _module: CUmodule,
+    stream: CUstream,
+    ev_round_start: CUevent,
+    ev_start: CUevent,
+    ev_end: CUevent,
+    fn_merkle_leaves: CUfunction,
+    fn_merkle_parents: CUfunction,
+    fn_gen_basis: CUfunction,
+    fn_gen_raw_pairs: CUfunction,
+    fn_reorder_pairs: CUfunction,
+    fn_mine_variants: [CUfunction; 4],
+    d_job_key: DevMem,
+    d_key_a: DevMem,
+    d_key_b: DevMem,
+    d_target_le: DevMem,
+    d_bas_a: DevMem,
+    d_bas_b: DevMem,
+    d_pairs: DevMem,
+    d_tree: DevMem,
+    ctrl: MappedControlPage,
+    hit_cap: usize,
+}
+
+unsafe impl Send for GpuWorkerEngine {}
+
+impl GpuWorkerEngine {
+    pub fn new(
+        info: GpuDeviceInfo,
+        profile: KernelProfile,
+        hit_cap: usize,
+        lock_mem_idle: bool,
+        core_lock_mhz: Option<u32>,
+        power_limit_w: Option<u32>,
+    ) -> Result<(Self, Vec<String>)> {
+        ensure!(
+            info.is_supported(),
+            "GPU #{} ({}, sm_{}{}) is outside RTX 40 (sm_89) / RTX 50 (sm_120) target architectures",
+            info.ordinal,
+            info.name,
+            info.sm_major,
+            info.sm_minor
+        );
+
+        let api = cuda()?;
+        let mut dev = 0;
+        check_cu(api, unsafe { (api.cuDeviceGet)(&mut dev, info.ordinal as c_int) }, "cuDeviceGet")?;
+        let mut ctx = std::ptr::null_mut();
+        check_cu(api, unsafe { (api.cuDevicePrimaryCtxRetain)(&mut ctx, dev) }, "cuDevicePrimaryCtxRetain")?;
+        check_cu(api, unsafe { (api.cuCtxSetCurrent)(ctx) }, "cuCtxSetCurrent")?;
+
+        // Pin L2 cache persistence window up to 16 MiB (working set at M=N=32768 is only 8.5 MiB!)
+        let mut max_persist = 0;
+        if unsafe { (api.cuDeviceGetAttribute)(&mut max_persist, CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE, dev) } == 0
+            && max_persist > 0
+        {
+            let want = (9 * 1024 * 1024usize).min(max_persist as usize);
+            let _ = unsafe { (api.cuCtxSetLimit)(CU_LIMIT_PERSISTING_L2_CACHE_SIZE, want) };
+        }
+
+        let cubin = if info.is_blackwell() { CUBIN_SM120A } else { CUBIN_SM89 };
+        let mut module = std::ptr::null_mut();
+        check_cu(
+            api,
+            unsafe { (api.cuModuleLoadData)(&mut module, cubin.as_ptr() as *const c_void) },
+            "cuModuleLoadData",
+        )?;
+
+        let get_fn = |name: &str| -> Result<CUfunction> {
+            let cs = CString::new(name).unwrap();
+            let mut f = std::ptr::null_mut();
+            check_cu(api, unsafe { (api.cuModuleGetFunction)(&mut f, module, cs.as_ptr()) }, name)?;
+            Ok(f)
+        };
+
+        let fn_merkle_leaves = get_fn("apx_merkle_leaves_const64")?;
+        let fn_merkle_parents = get_fn("apx_merkle_parents")?;
+        let fn_gen_basis = get_fn("apx_gen_basis_arch")?;
+        let fn_gen_raw_pairs = get_fn("apx_gen_raw_pairs")?;
+        let fn_reorder_pairs = get_fn("apx_reorder_pairs_arch")?;
+        let fn_mine_variants = [
+            get_fn("apx_basis_mine_v0")?,
+            get_fn("apx_basis_mine_v1")?,
+            get_fn("apx_basis_mine_v2")?,
+            get_fn("apx_basis_mine_v3")?,
+        ];
+
+        for &f in &fn_mine_variants {
+            check_cu(
+                api,
+                unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_CARVEOUT_BYTES) },
+                "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
+            )?;
+        }
+
+        let mut stream = std::ptr::null_mut();
+        check_cu(api, unsafe { (api.cuStreamCreate)(&mut stream, CU_STREAM_NON_BLOCKING) }, "cuStreamCreate")?;
+
+        let mut ev_round_start = std::ptr::null_mut();
+        let mut ev_start = std::ptr::null_mut();
+        let mut ev_end = std::ptr::null_mut();
+        check_cu(api, unsafe { (api.cuEventCreate)(&mut ev_round_start, CU_EVENT_BLOCKING_SYNC) }, "cuEventCreate")?;
+        check_cu(api, unsafe { (api.cuEventCreate)(&mut ev_start, CU_EVENT_BLOCKING_SYNC) }, "cuEventCreate")?;
+        check_cu(api, unsafe { (api.cuEventCreate)(&mut ev_end, CU_EVENT_BLOCKING_SYNC) }, "cuEventCreate")?;
+
+        let d_job_key = DevMem::alloc(api, 32)?;
+        let d_key_a = DevMem::alloc(api, 32)?;
+        let d_key_b = DevMem::alloc(api, 32)?;
+        let d_target_le = DevMem::alloc(api, 32)?;
+        let d_bas_a = DevMem::alloc(api, profile.m * 128)?;
+        let d_bas_b = DevMem::alloc(api, profile.n * 128)?;
+        let d_pairs = DevMem::alloc(api, profile.k * 8)?;
+        let d_tree = DevMem::alloc(api, Constant64MerkleCache::heap_byte_len(&profile))?;
+        let ctrl = MappedControlPage::alloc(api, hit_cap)?;
+
+        let mut nvml = NvmlHandle::open(info.ordinal, info.pci_bus_id);
+        let tune_notes = nvml
+            .as_mut()
+            .map(|h| h.apply_tuning(lock_mem_idle, core_lock_mhz, power_limit_w))
+            .unwrap_or_default();
+
+        Ok((
+            Self {
+                info,
+                profile,
+                active_variant: 0,
+                nvml,
+                ctx,
+                _module: module,
+                stream,
+                ev_round_start,
+                ev_start,
+                ev_end,
+                fn_merkle_leaves,
+                fn_merkle_parents,
+                fn_gen_basis,
+                fn_gen_raw_pairs,
+                fn_reorder_pairs,
+                fn_mine_variants,
+                d_job_key,
+                d_key_a,
+                d_key_b,
+                d_target_le,
+                d_bas_a,
+                d_bas_b,
+                d_pairs,
+                d_tree,
+                ctrl,
+                hit_cap,
+            },
+            tune_notes,
+        ))
+    }
+
+    pub fn bind_context(&self) -> Result<()> {
+        let api = cuda()?;
+        check_cu(api, unsafe { (api.cuCtxSetCurrent)(self.ctx) }, "cuCtxSetCurrent")
+    }
+
+    pub fn variant_name(&self, idx: usize) -> &'static str {
+        if self.info.is_blackwell() {
+            VARIANT_NAMES_BW[idx % 4]
+        } else {
+            VARIANT_NAMES_ADA[idx % 4]
+        }
+    }
+
+    /// Raw pointer to the mapped `abort_epoch` atomic (valid for lifetime of `GpuWorkerEngine`).
+    pub fn abort_epoch_atomic(&self) -> &AtomicU32 {
+        self.ctrl.epoch_atomic()
+    }
+
+    pub fn abort_epoch_ptr_usize(&self) -> usize {
+        self.ctrl.epoch_ptr_raw() as usize
+    }
+
+    pub fn sensors(&self) -> GpuSensors {
+        self.nvml
+            .as_ref()
+            .map(|h| h.read_sensors(self.info.pci_bus_id))
+            .unwrap_or(GpuSensors {
+                pci_bus_id: self.info.pci_bus_id,
+                ..Default::default()
+            })
+    }
+
+    /// Builds the Constant-64 Merkle heap on GPU (~1 ms), downloads it to construct `Constant64MerkleCache`,
+    /// and precomputes `d_bas_b` once for the entire pool job!
+    pub fn prepare_job(&mut self, job: &PreparedJob, epoch: u32) -> Result<Constant64MerkleCache> {
+        ensure!(job.profile == self.profile, "PreparedJob profile mismatch");
+        self.bind_context()?;
+        let api = cuda()?;
+
+        self.ctrl.epoch_atomic().store(epoch, Ordering::Release);
+
+        check_cu(
+            api,
+            unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_job_key.ptr, job.job_key.as_ptr() as *const c_void, 32, self.stream) },
+            "HtoD(job_key)",
+        )?;
+        check_cu(
+            api,
+            unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_target_le.ptr, job.bound_le.as_ptr() as *const c_void, 32, self.stream) },
+            "HtoD(target_le)",
+        )?;
+
+        let nleaves = ((self.profile.m * self.profile.k) / apexprl_pow::CHUNK_BYTES) as i32;
+        let mut p_key = self.d_job_key.ptr;
+        let mut p_tree = self.d_tree.ptr;
+        let mut p_nleaves = nleaves;
+        let mut args_leaves: [*mut c_void; 3] = [
+            (&mut p_key as *mut CUdeviceptr).cast(),
+            (&mut p_tree as *mut CUdeviceptr).cast(),
+            (&mut p_nleaves as *mut i32).cast(),
+        ];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    self.fn_merkle_leaves,
+                    ((nleaves as u32) + 127) / 128, 1, 1,
+                    128, 1, 1,
+                    0,
+                    self.stream,
+                    args_leaves.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "apx_merkle_leaves_const64",
+        )?;
+
+        let mut count = nleaves / 2;
+        while count >= 2 {
+            let mut first = count;
+            let mut cnt = count;
+            let mut args_par: [*mut c_void; 4] = [
+                (&mut p_key as *mut CUdeviceptr).cast(),
+                (&mut p_tree as *mut CUdeviceptr).cast(),
+                (&mut first as *mut i32).cast(),
+                (&mut cnt as *mut i32).cast(),
+            ];
+            check_cu(
+                api,
+                unsafe {
+                    (api.cuLaunchKernel)(
+                        self.fn_merkle_parents,
+                        ((count as u32) + 127) / 128, 1, 1,
+                        128, 1, 1,
+                        0,
+                        self.stream,
+                        args_par.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                "apx_merkle_parents",
+            )?;
+            count >>= 1;
+        }
+
+        let mut heap = vec![0u8; self.d_tree.bytes];
+        check_cu(
+            api,
+            unsafe { (api.cuMemcpyDtoHAsync_v2)(heap.as_mut_ptr() as *mut c_void, self.d_tree.ptr, heap.len(), self.stream) },
+            "DtoH(merkle_heap)",
+        )?;
+        check_cu(api, unsafe { (api.cuStreamSynchronize)(self.stream) }, "cuStreamSynchronize(job)")?;
+
+        let cache = Constant64MerkleCache::from_gpu_heap(job, heap)
+            .context("GPU Merkle heap validation failed")?;
+
+        // Upload `key_b` and materialize packed `d_bas_b` once per job!
+        check_cu(
+            api,
+            unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_key_b.ptr, cache.key_b.as_ptr() as *const c_void, 32, self.stream) },
+            "HtoD(key_b)",
+        )?;
+        let mut p_kb = self.d_key_b.ptr;
+        let mut p_bas_b = self.d_bas_b.ptr;
+        let mut rows_b = self.profile.n as i32;
+        let mut is_b: i32 = 1;
+        let mut args_bb: [*mut c_void; 4] = [
+            (&mut p_kb as *mut CUdeviceptr).cast(),
+            (&mut p_bas_b as *mut CUdeviceptr).cast(),
+            (&mut rows_b as *mut i32).cast(),
+            (&mut is_b as *mut i32).cast(),
+        ];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    self.fn_gen_basis,
+                    (self.profile.n / 16) as c_uint, 1, 1,
+                    64, 1, 1,
+                    0,
+                    self.stream,
+                    args_bb.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "apx_gen_basis_arch(B)",
+        )?;
+        check_cu(api, unsafe { (api.cuStreamSynchronize)(self.stream) }, "cuStreamSynchronize(basB)")?;
+
+        Ok(cache)
+    }
+
+    /// Executes one full mining round for `nonce` on `variant_idx` (`0..4`).
+    pub fn mine_round(
+        &mut self,
+        job: &PreparedJob,
+        cache: &Constant64MerkleCache,
+        nonce: u64,
+        epoch: u32,
+        variant_idx: usize,
+        greedy_reorder: bool,
+    ) -> Result<RoundOutcome> {
+        self.bind_context()?;
+        let api = cuda()?;
+
+        let (_sig, _root_a, key_a) = cache.derive_attempt(job, nonce);
+
+        check_cu(
+            api,
+            unsafe { (api.cuEventRecord)(self.ev_round_start, self.stream) },
+            "cuEventRecord(round_start)",
+        )?;
+
+        // Upload 32B key_a & zero hit counter asynchronously
+        check_cu(
+            api,
+            unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_key_a.ptr, key_a.as_ptr() as *const c_void, 32, self.stream) },
+            "HtoD(key_a)",
+        )?;
+        check_cu(
+            api,
+            unsafe { (api.cuMemsetD8Async)(self.ctrl.dev_hit_count_ptr(), 0, 4, self.stream) },
+            "Memset(hit_count)",
+        )?;
+
+        // 1. Fused Basis A generation (only sampled_m rows needed!)
+        let sampled_m = self.profile.sampled_m() as i32;
+        let mut p_ka = self.d_key_a.ptr;
+        let mut p_bas_a = self.d_bas_a.ptr;
+        let mut rows_a = sampled_m;
+        let mut is_b_zero: i32 = 0;
+        let mut args_ba: [*mut c_void; 4] = [
+            (&mut p_ka as *mut CUdeviceptr).cast(),
+            (&mut p_bas_a as *mut CUdeviceptr).cast(),
+            (&mut rows_a as *mut i32).cast(),
+            (&mut is_b_zero as *mut i32).cast(),
+        ];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    self.fn_gen_basis,
+                    (sampled_m as u32) / 16, 1, 1,
+                    64, 1, 1,
+                    0,
+                    self.stream,
+                    args_ba.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "apx_gen_basis_arch(A)",
+        )?;
+
+        // 2. Raw pairs generation + bank-conflict-aware reorder
+        let mut p_kb = self.d_key_b.ptr;
+        let mut p_pairs = self.d_pairs.ptr;
+        let mut k_i32 = self.profile.k as i32;
+        let mut args_rp: [*mut c_void; 4] = [
+            (&mut p_ka as *mut CUdeviceptr).cast(),
+            (&mut p_kb as *mut CUdeviceptr).cast(),
+            (&mut p_pairs as *mut CUdeviceptr).cast(),
+            (&mut k_i32 as *mut i32).cast(),
+        ];
+        let hash_lines = ((self.profile.k / 8) as u32 + 127) / 128;
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    self.fn_gen_raw_pairs,
+                    hash_lines, 1, 1,
+                    128, 1, 1,
+                    0,
+                    self.stream,
+                    args_rp.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "apx_gen_raw_pairs",
+        )?;
+
+        let mut enable_g: i32 = if greedy_reorder { 1 } else { 0 };
+        let mut args_ro: [*mut c_void; 3] = [
+            (&mut p_pairs as *mut CUdeviceptr).cast(),
+            (&mut k_i32 as *mut i32).cast(),
+            (&mut enable_g as *mut i32).cast(),
+        ];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    self.fn_reorder_pairs,
+                    ((self.profile.k / 128) as u32 + 3) / 4, 1, 1,
+                    128, 1, 1,
+                    0,
+                    self.stream,
+                    args_ro.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "apx_reorder_pairs_arch",
+        )?;
+
+        // 3. Persistent Basis GEMM + Jackpot Scan across all SMs
+        check_cu(api, unsafe { (api.cuEventRecord)(self.ev_start, self.stream) }, "cuEventRecord(start)")?;
+
+        let mut kparams = ApxBasisParams {
+            bas_a: self.d_bas_a.ptr,
+            bas_b: self.d_bas_b.ptr,
+            pairs: self.d_pairs.ptr,
+            sampled_m,
+            n: self.profile.n as i32,
+            k: self.profile.k as i32,
+            key_a: self.d_key_a.ptr,
+            target_le: self.d_target_le.ptr,
+            hit_count: self.ctrl.dev_hit_count_ptr(),
+            hit_groups: self.ctrl.dev_hit_groups_ptr(),
+            hit_cap: self.hit_cap as i32,
+            abort_epoch_ptr: self.ctrl.dev_abort_ptr(),
+            expected_epoch: epoch,
+        };
+        let mut launch_args: [*mut c_void; 1] = [(&mut kparams as *mut ApxBasisParams).cast()];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    self.fn_mine_variants[variant_idx % 4],
+                    self.info.sm_count as c_uint, 1, 1,
+                    256, 1, 1,
+                    SMEM_CARVEOUT_BYTES as c_uint,
+                    self.stream,
+                    launch_args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            self.variant_name(variant_idx),
+        )?;
+
+        check_cu(api, unsafe { (api.cuEventRecord)(self.ev_end, self.stream) }, "cuEventRecord(end)")?;
+        // Blocking sync: OS thread sleeps cleanly without burning CPU while GPU crunches!
+        check_cu(api, unsafe { (api.cuEventSynchronize)(self.ev_end) }, "cuEventSynchronize")?;
+
+        let mut round_ms = 0.0f32;
+        let mut kernel_ms = 0.0f32;
+        check_cu(
+            api,
+            unsafe { (api.cuEventElapsedTime)(&mut round_ms, self.ev_round_start, self.ev_end) },
+            "cuEventElapsedTime(round)",
+        )?;
+        check_cu(
+            api,
+            unsafe { (api.cuEventElapsedTime)(&mut kernel_ms, self.ev_start, self.ev_end) },
+            "cuEventElapsedTime(kernel)",
+        )?;
+
+        let aborted = self.ctrl.epoch_atomic().load(Ordering::Acquire) != epoch;
+        let (total_hits, mut hit_groups) = self.ctrl.read_hits(self.hit_cap);
+        hit_groups.sort_unstable();
+
+        Ok(RoundOutcome {
+            round_ms: round_ms.max(kernel_ms),
+            kernel_ms,
+            total_hits,
+            hit_groups,
+            aborted,
+        })
+    }
+
+    /// Runs an interleaved benchmark across all 4 placement variants (`v0..v3`), verifies
+    /// identical hit sets across every variant, and activates the fastest one!
+    pub fn run_autotune(&mut self, job: &PreparedJob, cache: &Constant64MerkleCache, epoch: u32, passes: usize) -> Result<(usize, Vec<(String, f64)>)> {
+        let test_nonce = 0x1337_c0de_2026_0001u64;
+        // Warmup + parity check across all 4 variants
+        let base = self.mine_round(job, cache, test_nonce, epoch, 0, true)?;
+        for v in 1..4 {
+            let chk = self.mine_round(job, cache, test_nonce, epoch, v, true)?;
+            let groups_match = if (base.total_hits as usize) <= self.hit_cap {
+                chk.hit_groups == base.hit_groups
+            } else {
+                true
+            };
+            ensure!(
+                chk.total_hits == base.total_hits && groups_match,
+                "Auto-tune parity failure on GPU #{} variant {}: hits {} vs {}",
+                self.info.ordinal,
+                self.variant_name(v),
+                chk.total_hits,
+                base.total_hits
+            );
+        }
+
+        let mut best_ms = [f32::MAX; 4];
+        let mut sum_ms = [0.0f64; 4];
+        for p in 0..passes.max(2) {
+            for step in 0..4 {
+                let v = (step + p) % 4; // rotate order each pass to cancel thermal drift
+                let r = self.mine_round(job, cache, test_nonce + (p as u64) + 1, epoch, v, true)?;
+                if r.aborted {
+                    bail!("Auto-tune interrupted");
+                }
+                best_ms[v] = best_ms[v].min(r.kernel_ms);
+                sum_ms[v] += r.kernel_ms as f64;
+            }
+        }
+
+        let macs = self.profile.macs_per_round();
+        let mut summary = Vec::with_capacity(4);
+        let mut winner = 0usize;
+        let mut winner_avg = f64::MAX;
+        for v in 0..4 {
+            let avg_ms = sum_ms[v] / (passes.max(2) as f64);
+            let th_s = (macs / (avg_ms * 1e-3)) * 1e-12;
+            summary.push((self.variant_name(v).to_string(), th_s));
+            if avg_ms < winner_avg {
+                winner_avg = avg_ms;
+                winner = v;
+            }
+        }
+        self.active_variant = winner;
+        Ok((winner, summary))
+    }
+}
+
+impl Drop for GpuWorkerEngine {
+    fn drop(&mut self) {
+        if let Ok(api) = cuda() {
+            unsafe {
+                let _ = (api.cuCtxSetCurrent)(self.ctx);
+                let _ = (api.cuStreamSynchronize)(self.stream);
+                let _ = (api.cuEventDestroy_v2)(self.ev_round_start);
+                let _ = (api.cuEventDestroy_v2)(self.ev_start);
+                let _ = (api.cuEventDestroy_v2)(self.ev_end);
+                let _ = (api.cuStreamDestroy_v2)(self.stream);
+            }
+        }
+    }
+}

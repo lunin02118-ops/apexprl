@@ -1,0 +1,23 @@
+{
+  "name": "ApexPRL_Kryptex_RTX40_50",
+  "isFavorite": true,
+  "items": [
+    {
+      "coin": "PRL",
+      "pool_ssl": true,
+      "pool_urls": [],
+      "miner": "custom",
+      "miner_alt": "apexprl",
+      "miner_config": {
+        "miner": "apexprl",
+        "algo": "pearlhash",
+        "url": "stratum+ssl://prl-ru.kryptex.network:8048\nstratum+ssl://prl-eu.kryptex.network:8048",
+        "template": "%WAL%.%WORKER_NAME%",
+        "pass": "auto",
+        "install_url": "https://github.com/lunin02118-ops/apexprl/releases/download/v0.1.0/apexprl-hiveos.tar.gz",
+        "user_config": "--lock-mem-idle --tune"
+      },
+      "pool_geo": []
+    }
+  ]
+}
