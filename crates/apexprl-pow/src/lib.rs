@@ -47,7 +47,32 @@ impl KernelProfile {
         Self::with_dims(DEFAULT_M, DEFAULT_N, k)
     }
 
-    /// Custom matrix dimensions (used for fast G0 unit tests as well as production 32768x32768).
+    /// Creates a Hyper-L2 Direct 2-CTA/SM (`128x128` CTA, `64x64` warp tile, `8x16` hash tile) profile
+    /// where `M >= N` and `M / N` is a power of two (allowing `B` to stay 100% resident in L2 cache!).
+    pub fn direct_l2_128x128(m: usize, n: usize, k: usize) -> Result<Self> {
+        ensure!(
+            matches!(k, 2048 | 4096 | 8192 | 16384 | 32768 | 65536),
+            "Unsupported K={k}; expected power-of-two in 2048..=65536"
+        );
+        ensure!(
+            m >= 256 && n >= 128 && m >= n && m % n == 0 && (m / n).is_power_of_two() && m % 128 == 0 && n % 128 == 0,
+            "Invalid Direct-L2 dims M={m}, N={n} (require M>=N, power-of-two ratio, multiples of 128)"
+        );
+        ensure!(
+            (m * k / CHUNK_BYTES).is_power_of_two() && (n * k / CHUNK_BYTES).is_power_of_two(),
+            "M*K/1024 and N*K/1024 must be powers of two for binary Merkle heap"
+        );
+        Ok(Self {
+            m,
+            n,
+            k,
+            cta_m: 128,
+            cta_n: 128,
+            sampling_rows: 8,
+        })
+    }
+
+    /// Custom matrix dimensions for 160x256 Basis Kernel (used for tests as well as production 32768x32768).
     pub fn with_dims(m: usize, n: usize, k: usize) -> Result<Self> {
         ensure!(
             matches!(k, 2048 | 4096 | 8192 | 16384 | 32768 | 65536),
@@ -66,6 +91,11 @@ impl KernelProfile {
             cta_n: 256,
             sampling_rows: 10,
         })
+    }
+
+    #[inline]
+    pub fn is_direct_l2(&self) -> bool {
+        self.cta_m == 128 && self.sampling_rows == 8
     }
 
     /// Number of M rows actually covered by full 160-row CTAs.
@@ -320,10 +350,15 @@ impl Constant64MerkleCache {
         2 * nleaves * 32
     }
 
-    /// Builds the entire Constant-64 Merkle heap on CPU using Rayon (used for tests or CPU fallback).
+    /// Builds the entire Constant-64 Merkle heap on CPU using Rayon (supports any power-of-two `M >= N`).
     pub fn build_cpu(job: &PreparedJob) -> Result<Self> {
         let profile = job.profile;
-        ensure!(profile.m == profile.n, "Constant64MerkleCache requires square M == N");
+        ensure!(
+            profile.m >= profile.n && profile.m % profile.n == 0 && (profile.m / profile.n).is_power_of_two(),
+            "Constant64MerkleCache requires M >= N with power-of-two ratio M/N (got M={}, N={})",
+            profile.m,
+            profile.n
+        );
         let nleaves = (profile.m * profile.k) / CHUNK_BYTES;
         ensure!(nleaves.is_power_of_two() && nleaves >= 2, "nleaves must be power of two >= 2");
 
@@ -365,11 +400,19 @@ impl Constant64MerkleCache {
     pub fn from_gpu_heap(job: &PreparedJob, heap: Vec<u8>) -> Result<Self> {
         let profile = job.profile;
         let nleaves = (profile.m * profile.k) / CHUNK_BYTES;
+        let nleaves_b = (profile.n * profile.k) / CHUNK_BYTES;
+        ensure!(
+            profile.m >= profile.n && profile.m % profile.n == 0 && (profile.m / profile.n).is_power_of_two() && nleaves_b >= 2,
+            "Invalid M/N ratio for shared Constant64 heap (M={}, N={})",
+            profile.m,
+            profile.n
+        );
         ensure!(heap.len() == 2 * nleaves * 32, "invalid Merkle heap size {}", heap.len());
         let hasher = Blake3Hasher::with_key(job.job_key);
-        let l2: [u8; 32] = heap[2 * 32..3 * 32].try_into().unwrap();
-        let r3: [u8; 32] = heap[3 * 32..4 * 32].try_into().unwrap();
-        let root_b = hasher.root_cv(&l2, &r3);
+        let b_root_idx = profile.m / profile.n; // 1 when M==N, 4 when M=32768 & N=8192, etc.
+        let lb: [u8; 32] = heap[(2 * b_root_idx) * 32..(2 * b_root_idx + 1) * 32].try_into().unwrap();
+        let rb: [u8; 32] = heap[(2 * b_root_idx + 1) * 32..(2 * b_root_idx + 2) * 32].try_into().unwrap();
+        let root_b = hasher.root_cv(&lb, &rb);
 
         let (key_b, _) = derive_noise_seeds(
             &job.job_key,
@@ -450,13 +493,15 @@ impl Constant64MerkleCache {
 
     fn build_matrix_proof(
         &self,
+        total_rows: usize,
         rows: Vec<usize>,
         root: [u8; 32],
         overrides: &HashMap<usize, [u8; 32]>,
         sig: Option<&[u8; 64]>,
     ) -> Result<MatrixMerkleProof> {
-        let leaves = MerkleTree::compute_leaf_indices_from_rows(&rows, (self.profile.m, self.profile.k));
-        ensure!(!leaves.is_empty() && *leaves.last().unwrap() < self.nleaves, "proof rows out of range");
+        let mat_leaves = (total_rows * self.profile.k) / CHUNK_BYTES;
+        let leaves = MerkleTree::compute_leaf_indices_from_rows(&rows, (total_rows, self.profile.k));
+        ensure!(!leaves.is_empty() && *leaves.last().unwrap() < mat_leaves, "proof rows out of range");
 
         let leaf_data = leaves
             .iter()
@@ -472,7 +517,9 @@ impl Constant64MerkleCache {
 
         let mut siblings = Vec::new();
         let mut current = leaves.clone();
-        let (mut width, mut base) = (self.nleaves, self.nleaves);
+        // Because `tree_b` is the exact leftmost subtree of `tree_a`, starting `base = self.nleaves`
+        // maps every level of `tree_b` (width = mat_leaves .. 2) directly into the shared heap!
+        let (mut width, mut base) = (mat_leaves, self.nleaves);
         while width > 1 {
             let selected: BTreeSet<usize> = current.iter().copied().collect();
             for &i in &current {
@@ -492,7 +539,7 @@ impl Constant64MerkleCache {
             proof: MerkleProof {
                 leaf_data,
                 leaf_indices: leaves,
-                total_leaves: self.nleaves,
+                total_leaves: mat_leaves,
                 root,
                 siblings,
             },
@@ -510,8 +557,8 @@ impl Constant64MerkleCache {
             n: self.profile.n,
             k: self.profile.k,
             noise_rank: NOISE_RANK,
-            a: self.build_matrix_proof(rows, root_a, &path_a, Some(&sig))?,
-            bt: self.build_matrix_proof(cols, self.root_b, &HashMap::new(), None)?,
+            a: self.build_matrix_proof(self.profile.m, rows, root_a, &path_a, Some(&sig))?,
+            bt: self.build_matrix_proof(self.profile.n, cols, self.root_b, &HashMap::new(), None)?,
             moe: None,
         })
     }
@@ -649,5 +696,39 @@ mod tests {
         let expanded = nbits_to_difficulty(bits);
         assert!(expanded <= kryptex_t);
         assert!(expanded > (kryptex_t >> 1));
+    }
+
+    #[test]
+    fn g0_direct_l2_rectangular_m_gt_n_verify_roundtrip() {
+        // Rectangular Direct-L2 shape: M=1024, N=256 (ratio=4), K=2048, CTA=128x128 (8x16 tile)
+        let profile = KernelProfile::direct_l2_128x128(1024, 256, 2048).unwrap();
+        let header_hex = "01000000".to_string() + &"33".repeat(32) + &"44".repeat(32) + "60504030" + "ffff7f20";
+        let target_hex = "000001".to_string() + &"ff".repeat(29);
+        let notify = PoolNotifyJob::from_stratum_params(&json!({
+            "job_id": "test_rect_2097152",
+            "header": header_hex,
+            "target": target_hex,
+            "height": 145000,
+            "cert_version": 3
+        }))
+        .unwrap();
+
+        let job = PreparedJob::new(notify, profile).unwrap();
+        let cache = Constant64MerkleCache::build_cpu(&job).unwrap();
+        let nonce = 0xfeed_face_2026_0077u64;
+        let (_sig, _root_a, key_a) = cache.derive_attempt(&job, nonce);
+
+        let bound = U256::from_little_endian(&job.bound_le);
+        let winning_grp = (0..profile.total_groups())
+            .find(|&g| {
+                let (_tr, digest) = cpu_eval_group_digest(&profile, &key_a, &cache.key_b, g);
+                U256::from_little_endian(&digest) <= bound
+            })
+            .expect("expected a winning group in rectangular M=1024, N=256 test");
+
+        let proof = cache.build_plain_proof(winning_grp, nonce).unwrap();
+        let (wire_gzip, raw_len, gz_len) = verify_and_encode_proof(&job, &proof, true).unwrap();
+        assert!(!wire_gzip.is_empty());
+        assert!(gz_len * 10 < raw_len);
     }
 }

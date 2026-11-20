@@ -8,8 +8,10 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/root/apexprl-target}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-echo "=== [1/4] Auditing CUDA SASS Kernels (SM89 Ada + SM120a Blackwell) ==="
+echo "=== [1/4] Auditing CUDA SASS Kernels (v0.2 Hyper-L2 Direct + Legacy Basis; SM89 Ada + SM120a Blackwell) ==="
 mkdir -p /root/apexprl-cubins
+nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 549 -arch=sm_89 -Xptxas -O3,-v --cubin kernels/apexprl_direct_sm89.cu -o /root/apexprl-cubins/apexprl_direct_sm89.cubin
+nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 549 -arch=sm_120a -Xptxas -O1,-v --cubin kernels/apexprl_direct_sm120a.cu -o /root/apexprl-cubins/apexprl_direct_sm120a.cubin
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 549 -arch=sm_89 -Xptxas -O1,-v --cubin kernels/apexprl_sm89.cu -o /root/apexprl-cubins/apexprl_sm89.cubin
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 549 -arch=sm_120a -Xptxas -O1,-v --cubin kernels/apexprl_sm120a.cu -o /root/apexprl-cubins/apexprl_sm120a.cubin
 python3 tools/check_sass.py /root/apexprl-cubins

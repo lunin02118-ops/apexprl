@@ -174,7 +174,13 @@ impl NvmlHandle {
                 }
             }
             if lock_mem_idle {
-                if let Some(set_mem) = api.set_mem_lock {
+                // Preserve existing external memory locks (e.g. PenguinBurner / HiveOS OC at 810 MHz),
+                // while still locking unlocked GPUs that may briefly idle at 405 MHz P8 before kernel launch.
+                let mut cur_mem_mhz = 0u32;
+                let got_mem = (api.get_clock)(self.dev, NVML_CLOCK_MEM, &mut cur_mem_mhz) == 0;
+                if got_mem && cur_mem_mhz >= 700 && cur_mem_mhz <= 1050 {
+                    notes.push(format!("MemLock=preserved({}MHz)", cur_mem_mhz));
+                } else if let Some(set_mem) = api.set_mem_lock {
                     // Try P8 810 MHz first, then P5 5001 MHz fallback
                     if set_mem(self.dev, 405, 810) == 0 {
                         self.locked_mem = true;

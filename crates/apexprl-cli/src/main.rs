@@ -5,7 +5,7 @@ mod api_server;
 
 use anyhow::{ensure, Context, Result};
 use api_server::{spawn_api_server, PerGpuStats, RigTelemetry, TelemetrySensors};
-use apexprl_gpu::{enumerate_gpus, GpuDeviceInfo, GpuWorkerEngine, TuneCacheFile};
+use apexprl_gpu::{enumerate_gpus, optimal_direct_l2_n, EngineKind, GpuDeviceInfo, GpuWorkerEngine, TuneCacheFile};
 use apexprl_pow::{
     cpu_eval_group_digest, optimal_kryptex_diff, verify_and_encode_proof, Constant64MerkleCache,
     KernelProfile, PoolNotifyJob, PreparedJob,
@@ -57,9 +57,13 @@ struct Cli {
     #[arg(long, visible_alias = "password", default_value = "auto")]
     pass: String,
 
-    /// Inner matrix dimension K (`4096`, `8192`, `16384`, `32768`, `65536`)
-    #[arg(long, default_value_t = 16384)]
-    k: usize,
+    /// Compute engine (`direct` = v0.2 Hyper-L2 Direct 2-CTA/SM [default], `basis` = v0.1 Basis-160x256)
+    #[arg(long, default_value = "direct")]
+    engine: String,
+
+    /// Inner matrix dimension K (defaults: `4096` for `direct`, `16384` for `basis`)
+    #[arg(long)]
+    k: Option<usize>,
 
     /// Comma-separated CUDA device indices (default: all RTX 40 / RTX 50 GPUs)
     #[arg(long, visible_alias = "gpu-id")]
@@ -69,7 +73,7 @@ struct Cli {
     #[arg(long)]
     list_devices: bool,
 
-    /// Run offline GPU-vs-CPU + official `zk-pow` verification test and exit
+    /// Run offline GPU-vs-CPU + official `zk-pow` verification test (both Direct-L2 & Basis engines) and exit
     #[arg(long, visible_alias = "selftest")]
     self_test: bool,
 
@@ -77,7 +81,7 @@ struct Cli {
     #[arg(long)]
     benchmark: Option<u64>,
 
-    /// Calibrate PTX instruction placement variants (`v0..v3`) on startup
+    /// Calibrate CUDA/PTX kernel variants on startup
     #[arg(long)]
     tune: bool,
 
@@ -156,20 +160,51 @@ fn select_gpus(filter: Option<&str>) -> Result<Vec<GpuDeviceInfo>> {
     }
 }
 
-/// Runs rigorous Gate G0 hardware verification on every selected GPU:
-/// 1. Builds Merkle heap on GPU and checks root against CPU `Blake3Hasher`.
-/// 2. Runs all 4 placement variants (`v0..v3`) with an easy target and checks 100% identical hit sets.
-/// 3. Cross-checks GPU hit digests against exact CPU `cpu_eval_group_digest`.
-/// 4. Assembles a full `PlainProof` and verifies it via official `zk-pow::verify_plain_proof` + `gzip`!
-fn run_hardware_selftest(gpus: &[GpuDeviceInfo], cli: &Cli) -> Result<()> {
-    println!("[selftest] Starting hardware + zk-pow verification across {} GPU(s)...", gpus.len());
-    // Fast test shape: M=1024, N=1024, K=2048 -> 2048 leaves, 6 sampled M-blocks of 160 = 960 rows
-    let profile = KernelProfile::with_dims(1024, 1024, 2048)?;
+fn parse_engine(raw: &str) -> Result<EngineKind> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "direct" | "hyper-l2" | "hl2" | "l2" => Ok(EngineKind::DirectL2),
+        "basis" | "basis160" | "legacy" => Ok(EngineKind::Basis160),
+        other => anyhow::bail!("Unsupported --engine '{other}'; expected 'direct' or 'basis'"),
+    }
+}
+
+fn build_profile(gpus: &[GpuDeviceInfo], engine: EngineKind, k_opt: Option<usize>, gzip_v2: bool) -> Result<KernelProfile> {
+    match engine {
+        EngineKind::DirectL2 => {
+            let raw_k = k_opt.unwrap_or(4096);
+            let active_k = if !gzip_v2 && raw_k > 4096 {
+                println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096");
+                4096
+            } else {
+                raw_k
+            };
+            let min_l2 = gpus
+                .iter()
+                .map(|g| g.l2_bytes)
+                .filter(|&b| b > 0)
+                .min()
+                .unwrap_or(32 * 1024 * 1024);
+            let n = optimal_direct_l2_n(min_l2, active_k);
+            KernelProfile::direct_l2_128x128(32768, n, active_k)
+        }
+        EngineKind::Basis160 => {
+            let raw_k = k_opt.unwrap_or(16384);
+            let active_k = if !gzip_v2 && raw_k > 4096 {
+                println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096 to fit plain proof limit");
+                4096
+            } else {
+                raw_k
+            };
+            KernelProfile::basis_160x256(active_k)
+        }
+    }
+}
+
+fn verify_selftest_profile(gpus: &[GpuDeviceInfo], cli: &Cli, label: &str, profile: KernelProfile) -> Result<()> {
     let header_hex = "01000000".to_string() + &"aa".repeat(32) + &"bb".repeat(32) + "78563412" + "ffff0f1e";
-    // Target <= U256::MAX / (160 * 2048): ~4% hit rate (~245 hits across 6144 groups)
     let target_hex = "000001".to_string() + &"ff".repeat(29);
     let notify = PoolNotifyJob::from_stratum_params(&json!({
-        "job_id": "selftest_v3",
+        "job_id": format!("selftest_{label}_v3"),
         "header": header_hex,
         "target": target_hex,
         "height": 140000,
@@ -190,36 +225,39 @@ fn run_hardware_selftest(gpus: &[GpuDeviceInfo], cli: &Cli) -> Result<()> {
         let gpu_cache = eng.prepare_job(&job, 1)?;
         ensure!(
             gpu_cache.root_b == cpu_cache.root_b && gpu_cache.key_b == cpu_cache.key_b,
-            "GPU #{} Merkle root mismatch vs CPU reference!",
+            "GPU #{} [{label}] Merkle root mismatch vs CPU reference!",
             info.ordinal
         );
 
         let nonce = 0x2026_1118_a9ef_0042u64;
         let (_sig, _root_a, key_a) = gpu_cache.derive_attempt(&job, nonce);
 
-        // Verify greedy reorder == non-greedy reorder == all 4 variants v0..v3!
-        let ref_no_greedy = eng.mine_round(&job, &gpu_cache, nonce, 1, 0, false)?;
-        ensure!(ref_no_greedy.total_hits > 0, "Expected >0 hits in selftest, got 0");
+        let ref_base = eng.mine_round(&job, &gpu_cache, nonce, 1, 0, false)?;
+        ensure!(
+            ref_base.total_hits > 0,
+            "Expected >0 hits in [{label}] selftest on GPU #{}, got 0",
+            info.ordinal
+        );
 
-        for v in 0..4 {
+        let nv = eng.num_variants();
+        for v in 0..nv {
             let r = eng.mine_round(&job, &gpu_cache, nonce, 1, v, true)?;
             ensure!(
-                r.total_hits == ref_no_greedy.total_hits && r.hit_groups == ref_no_greedy.hit_groups,
-                "GPU #{} variant {} hit set mismatch vs non-greedy baseline ({} vs {})!",
+                r.total_hits == ref_base.total_hits && r.hit_groups == ref_base.hit_groups,
+                "GPU #{} [{label}] variant {} hit set mismatch vs baseline ({} vs {})!",
                 info.ordinal,
                 eng.variant_name(v),
                 r.total_hits,
-                ref_no_greedy.total_hits
+                ref_base.total_hits
             );
         }
 
-        // Verify every hit against CPU reference & verify first 3 shares with official zk-pow!
         let bound_u256 = U256::from_little_endian(&job.bound_le);
-        for (idx, &grp) in ref_no_greedy.hit_groups.iter().take(16).enumerate() {
+        for (idx, &grp) in ref_base.hit_groups.iter().take(16).enumerate() {
             let (_tr, cpu_digest) = cpu_eval_group_digest(&profile, &key_a, &gpu_cache.key_b, grp);
             ensure!(
                 U256::from_little_endian(&cpu_digest) <= bound_u256,
-                "GPU #{} reported false hit on group {}!",
+                "GPU #{} [{label}] reported false hit on group {}!",
                 info.ordinal,
                 grp
             );
@@ -228,12 +266,16 @@ fn run_hardware_selftest(gpus: &[GpuDeviceInfo], cli: &Cli) -> Result<()> {
                 let (_b64, raw_b, gz_b) = verify_and_encode_proof(&job, &proof, true)?;
                 if idx == 0 {
                     println!(
-                        "[selftest] GPU #{} ({}, sm_{}{}): {} hits matched CPU + all 4 variants + zk-pow V3 OK (gzip {}B -> {}B, {:.1}x)!",
+                        "[selftest] GPU #{} ({}, sm_{}{}) [{label} {}x{}x{}]: {} hits matched CPU + all {} variants + zk-pow V3 OK (gzip {}B -> {}B, {:.1}x)!",
                         info.ordinal,
                         info.name,
                         info.sm_major,
                         info.sm_minor,
-                        ref_no_greedy.total_hits,
+                        profile.m,
+                        profile.n,
+                        profile.k,
+                        ref_base.total_hits,
+                        nv,
                         raw_b,
                         gz_b,
                         (raw_b as f64) / (gz_b.max(1) as f64)
@@ -242,14 +284,31 @@ fn run_hardware_selftest(gpus: &[GpuDeviceInfo], cli: &Cli) -> Result<()> {
             }
         }
     }
-    println!("[selftest] ALL CHECKS PASSED (BIT-EXACT GPU == CPU == ZK-POW V3)!");
+    Ok(())
+}
+
+/// Runs rigorous Gate G0 hardware verification across BOTH `DirectL2` (v0.2) and `Basis160` (v0.1):
+/// 1. Builds Merkle heap on GPU (including rectangular `M > N` subtree) and checks root vs CPU.
+/// 2. Runs every kernel variant (`hl2-2cta`, `hl2-2cta-s2/df`, `hl2-3stg` & `v0..v3`) for 100% hit parity.
+/// 3. Cross-checks GPU hit digests against exact CPU `cpu_eval_group_digest`.
+/// 4. Verifies full `PlainProof` via official `zk-pow::verify_plain_proof` + `gzip`!
+fn run_hardware_selftest(gpus: &[GpuDeviceInfo], cli: &Cli) -> Result<()> {
+    println!("[selftest] Starting dual-engine hardware + zk-pow verification across {} GPU(s)...", gpus.len());
+    // 1. v0.2 Hyper-L2 Direct rectangular M > N shape (1024x512x2048: n_tiles=4 even for v2 3-stage too!)
+    verify_selftest_profile(gpus, cli, "direct-l2", KernelProfile::direct_l2_128x128(1024, 512, 2048)?)?;
+    // 2. v0.1 Basis-160x256 shape (1024x1024x2048)
+    verify_selftest_profile(gpus, cli, "basis-160", KernelProfile::with_dims(1024, 1024, 2048)?)?;
+    println!("[selftest] ALL CHECKS PASSED (BIT-EXACT GPU == CPU == ZK-POW V3 FOR BOTH ENGINES)!");
     Ok(())
 }
 
 fn run_offline_benchmark(gpus: &[GpuDeviceInfo], cli: &Cli, seconds: u64) -> Result<()> {
-    let profile = KernelProfile::basis_160x256(cli.k)?;
+    let engine = parse_engine(&cli.engine)?;
+    let profile = build_profile(gpus, engine, cli.k, true)?;
     println!(
-        "[bench] Full-matrix L2-resident Basis Benchmark: M={} (sampled {}), N={}, K={} ({:.2} TMAC/round) for {}s...",
+        "[bench] ApexPRL v{} Benchmark [engine={}]: M={} (sampled {}), N={}, K={} ({:.2} TMAC/round) for {}s...",
+        env!("CARGO_PKG_VERSION"),
+        cli.engine,
         profile.m,
         profile.sampled_m(),
         profile.n,
@@ -297,51 +356,73 @@ fn run_offline_benchmark(gpus: &[GpuDeviceInfo], cli: &Cli, seconds: u64) -> Res
             cli.cclock_lock,
             cli.pl,
         )?;
+        println!("[bench] GPU #{} layout: {}", info.ordinal, eng.layout_summary());
         if !notes.is_empty() {
             println!("[bench] GPU #{} NVML tuning: {}", info.ordinal, notes.join(", "));
         }
         let cache = eng.prepare_job(&job, 1)?;
         if cli.tune {
-            let (win, scores) = eng.run_autotune(&job, &cache, 1, 2)?;
+            let (win, scores) = eng.run_autotune(&job, &cache, 1, 3)?;
             let summary: Vec<String> = scores.iter().map(|(n, r)| format!("{n}={r:.2}TH/s")).collect();
             println!("[tune] GPU #{} selected '{}' ({})", info.ordinal, eng.variant_name(win), summary.join(", "));
+        }
+
+        // Short warm-up so boost clocks & L2 stabilize before timed window
+        for w in 0..3u64 {
+            let _ = eng.mine_round(&job, &cache, 500 + w, 1, eng.active_variant, true)?;
         }
 
         let t0 = Instant::now();
         let mut rounds = 0u64;
         let mut round_sec = 0.0f64;
         let mut kernel_sec = 0.0f64;
+        let mut sum_sm_mhz = 0.0f64;
+        let mut sum_power_w = 0.0f64;
+        let mut sens_n = 0u64;
+        let mut last_sens = eng.sensors();
         while t0.elapsed() < Duration::from_secs(seconds.max(3)) && !STOP_SIGNAL.load(Ordering::Relaxed) {
             let out = eng.mine_round(&job, &cache, 1000 + rounds, 1, eng.active_variant, true)?;
             rounds += 1;
             round_sec += (out.round_ms as f64) * 1e-3;
             kernel_sec += (out.kernel_ms as f64) * 1e-3;
             let cur_ths_macs = ((rounds as f64) * profile.macs_per_round()) / round_sec.max(1e-6);
-            let cur_sens = eng.sensors();
-            if let Some(gs) = telemetry.write().unwrap().gpus.get_mut(slot_i) {
-                gs.variant = eng.variant_name(eng.active_variant).to_string();
-                gs.hashrate_macs = cur_ths_macs;
-                gs.sensors = TelemetrySensors::from(cur_sens);
+            if rounds % 4 == 1 || t0.elapsed() >= Duration::from_secs(seconds.max(3)) {
+                let cur_sens = eng.sensors();
+                last_sens = cur_sens;
+                if cur_sens.sm_clock_mhz > 0 {
+                    sum_sm_mhz += cur_sens.sm_clock_mhz as f64;
+                    sum_power_w += cur_sens.power_w as f64;
+                    sens_n += 1;
+                }
+                if let Some(gs) = telemetry.write().unwrap().gpus.get_mut(slot_i) {
+                    gs.variant = eng.variant_name(eng.active_variant).to_string();
+                    gs.hashrate_macs = cur_ths_macs;
+                    gs.sensors = TelemetrySensors::from(cur_sens);
+                }
             }
         }
-        let sens = eng.sensors();
+        let avg_sm_mhz = if sens_n > 0 { sum_sm_mhz / (sens_n as f64) } else { last_sens.sm_clock_mhz as f64 };
+        let avg_power_w = if sens_n > 0 { sum_power_w / (sens_n as f64) } else { last_sens.power_w as f64 };
         let total_macs = (rounds as f64) * profile.macs_per_round();
         let kernel_ths = (total_macs / kernel_sec.max(1e-6)) * 1e-12;
         let sustained_ths = (total_macs / round_sec.max(1e-6)) * 1e-12;
-        let eff = if sens.power_w > 1.0 { sustained_ths / (sens.power_w as f64) } else { 0.0 };
+        let eff = if avg_power_w > 1.0 { sustained_ths / avg_power_w } else { 0.0 };
+        let sol_ths = (info.sm_count as f64) * 1024.0 * avg_sm_mhz * 1e-6;
+        let sol_pct = if sol_ths > 0.1 { (sustained_ths / sol_ths) * 100.0 } else { 0.0 };
         println!(
-            "[bench] GPU #{} ({}) [{}]: Sustained={:.2} TH/s (Kernel={:.2} TH/s, Overhead={:.2}%) | {:.1} W | {:.3} TH/s/W | SM={} MHz Mem={} MHz Temp={}°C",
+            "[bench] GPU #{} ({}) [{}]: Sustained={:.2} TH/s (Kernel={:.2} TH/s, Ovh={:.2}%, SOL={:.1}%) | {:.1} W | {:.3} TH/s/W | avgSM={:.0} MHz Mem={} MHz Temp={}°C",
             info.ordinal,
             info.name,
             eng.variant_name(eng.active_variant),
             sustained_ths,
             kernel_ths,
             (1.0 - sustained_ths / kernel_ths.max(1e-9)).max(0.0) * 100.0,
-            sens.power_w,
+            sol_pct,
+            avg_power_w,
             eff,
-            sens.sm_clock_mhz,
-            sens.mem_clock_mhz,
-            sens.temp_c
+            avg_sm_mhz,
+            last_sens.mem_clock_mhz,
+            last_sens.temp_c
         );
     }
     Ok(())
@@ -392,6 +473,7 @@ fn main() -> Result<()> {
         !cli.wallet.trim().is_empty(),
         "Missing --wallet <KRX_ID_OR_PRL_ADDR> (or run with --self-test / --benchmark 10)"
     );
+    let _ = parse_engine(&cli.engine)?;
 
     let pools = if cli.pools.is_empty() {
         vec![
@@ -461,13 +543,13 @@ fn main() -> Result<()> {
         }
     };
 
-    let active_k = if !session.gzip_v2 && cli.k > 4096 {
-        println!("[stratum] Pool did not negotiate gzip-v2; stepping K={} -> 4096 to fit plain proof limit", cli.k);
-        4096
-    } else {
-        cli.k
+    let engine = parse_engine(&cli.engine)?;
+    let profile = build_profile(&gpus, engine, cli.k, session.gzip_v2)?;
+    let active_k = profile.k;
+    let engine_tag = match engine {
+        EngineKind::DirectL2 => "direct",
+        EngineKind::Basis160 => "basis",
     };
-    let profile = KernelProfile::basis_160x256(active_k)?;
 
     let global_epoch = Arc::new(AtomicU32::new(1));
     let global_nonce = Arc::new(AtomicU64::new(
@@ -499,12 +581,15 @@ fn main() -> Result<()> {
             cli.pl,
         )?;
         let cache = eng.prepare_job(&first_prep, 1)?;
-        let tune_key = format!("{}_sm{}{}_k{}", info.name, info.sm_major, info.sm_minor, active_k);
+        let tune_key = format!(
+            "v02_{}_{}_sm{}{}_n{}_k{}",
+            engine_tag, info.name, info.sm_major, info.sm_minor, profile.n, active_k
+        );
         if let Some(&cached_v) = tune_db.entries.get(&tune_key) {
-            eng.active_variant = cached_v % 4;
+            eng.active_variant = cached_v % eng.num_variants();
         } else if cli.tune {
-            println!("[tune] Calibrating GPU #{} ({})...", info.ordinal, info.name);
-            if let Ok((win, scores)) = eng.run_autotune(&first_prep, &cache, 1, 2) {
+            println!("[tune] Calibrating GPU #{} ({}) [{}]...", info.ordinal, info.name, engine_tag);
+            if let Ok((win, scores)) = eng.run_autotune(&first_prep, &cache, 1, 3) {
                 let s: Vec<String> = scores.iter().map(|(n, r)| format!("{n}:{r:.1}")).collect();
                 println!("[tune] GPU #{} winner: {} ({})", info.ordinal, eng.variant_name(win), s.join(" "));
                 tune_db.entries.insert(tune_key, win);
@@ -512,13 +597,14 @@ fn main() -> Result<()> {
             }
         }
         println!(
-            "[gpu #{}] {} (sm_{}{}, {} SMs) ready | kernel={} | NVML=[{}]",
+            "[gpu #{}] {} (sm_{}{}, {} SMs) ready | kernel={} | {} | NVML=[{}]",
             info.ordinal,
             info.name,
             info.sm_major,
             info.sm_minor,
             info.sm_count,
             eng.variant_name(eng.active_variant),
+            eng.layout_summary(),
             notes.join(", ")
         );
         abort_ptrs_usize.push(eng.abort_epoch_ptr_usize());
