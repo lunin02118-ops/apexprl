@@ -17,15 +17,20 @@ use std::ffi::{c_int, c_uint, c_void, CStr, CString};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+const CUBIN_B128_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_b128_sm89.cubin"));
+const CUBIN_B128_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_b128_sm120a.cubin"));
 const CUBIN_DIRECT_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_direct_sm89.cubin"));
 const CUBIN_DIRECT_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_direct_sm120a.cubin"));
 const CUBIN_BASIS_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_sm89.cubin"));
 const CUBIN_BASIS_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_sm120a.cubin"));
 
+pub const SMEM_BASIS128_BYTES: c_int = 90240; // 16KiB A + 32KiB B + 2*12KiB stage + 16KiB trace + 128B bar
 pub const SMEM_BASIS_BYTES: c_int = 96320;
 pub const SMEM_DIRECT_2CTA_BYTES: c_int = 41088; // 2 * 16384 + 8192 + 128 (x2 CTAs/SM = 82,176 B <= 99 KiB)
 pub const SMEM_DIRECT_3STG_BYTES: c_int = 90240; // 3 * 24576 + 16384 + 128
 
+pub const VARIANT_NAMES_B128_ADA: [&str; 4] = ["ada128-c9", "ada128-c8", "ada128-c0", "ada128-c6"];
+pub const VARIANT_NAMES_B128_BW: [&str; 4] = ["bw128-c9", "bw128-c8", "bw128-c0", "bw128-c6"];
 pub const VARIANT_NAMES_DIRECT_ADA: [&str; 3] = ["hl2-2cta", "hl2-2cta-s2", "hl2-3stg"];
 pub const VARIANT_NAMES_DIRECT_BW: [&str; 3] = ["hl2-2cta", "hl2-2cta-df", "hl2-3stg"];
 pub const VARIANT_NAMES_BASIS_ADA: [&str; 4] = ["ada-u6", "ada-y5m1", "ada-u10", "ada-early"];
@@ -33,8 +38,9 @@ pub const VARIANT_NAMES_BASIS_BW: [&str; 4] = ["bw-u6", "bw-y5m1", "bw-w5q21", "
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineKind {
-    DirectL2,
+    Basis128,
     Basis160,
+    DirectL2,
 }
 
 #[repr(C)]
@@ -370,7 +376,7 @@ enum EngineBackend {
         d_panel_b: DevMem,
         panel_m_tiles: usize,
     },
-    Basis160 {
+    Basis {
         _module: CUmodule,
         fn_merkle_leaves: CUfunction,
         fn_merkle_parents: CUfunction,
@@ -378,6 +384,7 @@ enum EngineBackend {
         fn_gen_raw_pairs: CUfunction,
         fn_reorder_pairs: CUfunction,
         fn_variants: [CUfunction; 4],
+        smem_bytes: c_int,
         d_pairs: DevMem,
     },
 }
@@ -397,8 +404,11 @@ pub struct GpuWorkerEngine {
     d_key_a: DevMem,
     d_key_b: DevMem,
     d_target_le: DevMem,
-    d_bas_a: DevMem,
-    d_bas_b: DevMem,
+    /// Single contiguous allocation holding `d_bas_a` followed immediately by `d_bas_b`
+    /// (`8.38 MiB` at `32768x32768`), allowing 100% single-window L2 persistence pinning!
+    d_bas_ab: DevMem,
+    bas_b_offset: u64,
+    l2_pinned_bytes: usize,
     d_tree: DevMem,
     ctrl: MappedControlPage,
     hit_cap: usize,
@@ -407,7 +417,48 @@ pub struct GpuWorkerEngine {
 
 unsafe impl Send for GpuWorkerEngine {}
 
+fn pin_l2_window(api: &CudaApi, dev: CUdevice, stream: CUstream, base_ptr: CUdeviceptr, num_bytes: usize) -> usize {
+    let mut max_persist = 0i32;
+    let mut max_win = 0i32;
+    unsafe {
+        let _ = (api.cuDeviceGetAttribute)(&mut max_persist, CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE, dev);
+        let _ = (api.cuDeviceGetAttribute)(&mut max_win, CU_DEVICE_ATTRIBUTE_MAX_ACCESS_POLICY_WINDOW_SIZE, dev);
+    }
+    if max_persist <= 0 || num_bytes == 0 {
+        return 0;
+    }
+    let persist_want = num_bytes.min(max_persist as usize);
+    let _ = unsafe { (api.cuCtxSetLimit)(CU_LIMIT_PERSISTING_L2_CACHE_SIZE, persist_want) };
+    if let Some(set_attr) = api.cuStreamSetAttribute {
+        let win_bytes = if max_win > 0 { num_bytes.min(max_win as usize) } else { num_bytes };
+        let hit_ratio = ((persist_want as f32) / (win_bytes.max(1) as f32)).clamp(0.1, 1.0);
+        let val = CUstreamAttrValue {
+            access_policy_window: CUaccessPolicyWindow {
+                base_ptr: base_ptr as *mut c_void,
+                num_bytes: win_bytes,
+                hit_ratio,
+                hit_prop: CU_ACCESS_PROPERTY_PERSISTING,
+                miss_prop: CU_ACCESS_PROPERTY_NORMAL,
+            },
+        };
+        if unsafe { set_attr(stream, CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW, &val) } == 0 {
+            return persist_want;
+        }
+    }
+    persist_want
+}
+
 impl GpuWorkerEngine {
+    #[inline]
+    fn bas_a_ptr(&self) -> CUdeviceptr {
+        self.d_bas_ab.ptr
+    }
+
+    #[inline]
+    fn bas_b_ptr(&self) -> CUdeviceptr {
+        self.d_bas_ab.ptr + self.bas_b_offset
+    }
+
     pub fn new(
         info: GpuDeviceInfo,
         profile: KernelProfile,
@@ -427,6 +478,8 @@ impl GpuWorkerEngine {
 
         let engine_kind = if profile.is_direct_l2() {
             EngineKind::DirectL2
+        } else if profile.is_basis_128() {
+            EngineKind::Basis128
         } else {
             EngineKind::Basis160
         };
@@ -452,10 +505,13 @@ impl GpuWorkerEngine {
         let d_key_a = DevMem::alloc(api, 32)?;
         let d_key_b = DevMem::alloc(api, 32)?;
         let d_target_le = DevMem::alloc(api, 32)?;
-        let d_bas_a = DevMem::alloc(api, profile.m * 128)?;
-        let d_bas_b = DevMem::alloc(api, profile.n * 128)?;
+        let bas_a_bytes = profile.m * 128;
+        let bas_b_bytes = profile.n * 128;
+        let d_bas_ab = DevMem::alloc(api, bas_a_bytes + bas_b_bytes)?;
+        let bas_b_offset = bas_a_bytes as u64;
         let d_tree = DevMem::alloc(api, Constant64MerkleCache::heap_byte_len(&profile))?;
         let ctrl = MappedControlPage::alloc(api, hit_cap)?;
+        let l2_pinned_bytes;
 
         let backend = match engine_kind {
             EngineKind::DirectL2 => {
@@ -484,12 +540,16 @@ impl GpuWorkerEngine {
                 check_cu(api, unsafe { (api.cuFuncSetAttribute)(fn_v0, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_DIRECT_2CTA_BYTES) }, "smem(v0)")?;
                 check_cu(api, unsafe { (api.cuFuncSetAttribute)(fn_v1, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_DIRECT_2CTA_BYTES) }, "smem(v1)")?;
                 check_cu(api, unsafe { (api.cuFuncSetAttribute)(fn_v2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_DIRECT_3STG_BYTES) }, "smem(v2)")?;
+                for &f in &[fn_v0, fn_v1, fn_v2] {
+                    let _ = unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100) };
+                }
 
                 let panel_m_tiles = optimal_panel_m_tiles(&info, &profile);
                 let d_pairs_a = DevMem::alloc(api, profile.k * 2)?;
                 let d_pairs_b = DevMem::alloc(api, profile.k * 2)?;
                 let d_panel_a = DevMem::alloc(api, panel_m_tiles * 128 * profile.k)?;
                 let d_panel_b = DevMem::alloc(api, profile.n * profile.k)?;
+                l2_pinned_bytes = pin_l2_window(api, dev, stream, d_panel_b.ptr, profile.n * profile.k);
 
                 EngineBackend::DirectL2 {
                     _module: module,
@@ -506,20 +566,20 @@ impl GpuWorkerEngine {
                     panel_m_tiles,
                 }
             }
-            EngineKind::Basis160 => {
-                let mut max_persist = 0;
-                if unsafe { (api.cuDeviceGetAttribute)(&mut max_persist, CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE, dev) } == 0
-                    && max_persist > 0
-                {
-                    let want = (9 * 1024 * 1024usize).min(max_persist as usize);
-                    let _ = unsafe { (api.cuCtxSetLimit)(CU_LIMIT_PERSISTING_L2_CACHE_SIZE, want) };
-                }
-                let cubin = if info.is_blackwell() { CUBIN_BASIS_SM120A } else { CUBIN_BASIS_SM89 };
+            EngineKind::Basis128 | EngineKind::Basis160 => {
+                let is_b128 = engine_kind == EngineKind::Basis128;
+                l2_pinned_bytes = pin_l2_window(api, dev, stream, d_bas_ab.ptr, bas_a_bytes + bas_b_bytes);
+                let cubin = match (is_b128, info.is_blackwell()) {
+                    (true, true) => CUBIN_B128_SM120A,
+                    (true, false) => CUBIN_B128_SM89,
+                    (false, true) => CUBIN_BASIS_SM120A,
+                    (false, false) => CUBIN_BASIS_SM89,
+                };
                 let mut module = std::ptr::null_mut();
                 check_cu(
                     api,
                     unsafe { (api.cuModuleLoadData)(&mut module, cubin.as_ptr() as *const c_void) },
-                    "cuModuleLoadData(basis)",
+                    if is_b128 { "cuModuleLoadData(basis128)" } else { "cuModuleLoadData(basis160)" },
                 )?;
                 let get_fn = |name: &str| -> Result<CUfunction> {
                     let cs = CString::new(name).unwrap();
@@ -532,17 +592,20 @@ impl GpuWorkerEngine {
                 let fn_gen_basis = get_fn("apx_gen_basis_arch")?;
                 let fn_gen_raw_pairs = get_fn("apx_gen_raw_pairs")?;
                 let fn_reorder_pairs = get_fn("apx_reorder_pairs_arch")?;
+                let prefix = if is_b128 { "apx_b128_mine" } else { "apx_basis_mine" };
                 let fn_variants = [
-                    get_fn("apx_basis_mine_v0")?,
-                    get_fn("apx_basis_mine_v1")?,
-                    get_fn("apx_basis_mine_v2")?,
-                    get_fn("apx_basis_mine_v3")?,
+                    get_fn(&format!("{prefix}_v0"))?,
+                    get_fn(&format!("{prefix}_v1"))?,
+                    get_fn(&format!("{prefix}_v2"))?,
+                    get_fn(&format!("{prefix}_v3"))?,
                 ];
+                let smem_bytes = if is_b128 { SMEM_BASIS128_BYTES } else { SMEM_BASIS_BYTES };
                 for &f in &fn_variants {
-                    check_cu(api, unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_BASIS_BYTES) }, "smem(basis)")?;
+                    check_cu(api, unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_bytes) }, "smem(basis)")?;
+                    let _ = unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100) };
                 }
                 let d_pairs = DevMem::alloc(api, profile.k * 8)?;
-                EngineBackend::Basis160 {
+                EngineBackend::Basis {
                     _module: module,
                     fn_merkle_leaves,
                     fn_merkle_parents,
@@ -550,6 +613,7 @@ impl GpuWorkerEngine {
                     fn_gen_raw_pairs,
                     fn_reorder_pairs,
                     fn_variants,
+                    smem_bytes,
                     d_pairs,
                 }
             }
@@ -577,8 +641,9 @@ impl GpuWorkerEngine {
                 d_key_a,
                 d_key_b,
                 d_target_le,
-                d_bas_a,
-                d_bas_b,
+                d_bas_ab,
+                bas_b_offset,
+                l2_pinned_bytes,
                 d_tree,
                 ctrl,
                 hit_cap,
@@ -596,7 +661,7 @@ impl GpuWorkerEngine {
     pub fn num_variants(&self) -> usize {
         match self.engine_kind {
             EngineKind::DirectL2 => 3,
-            EngineKind::Basis160 => 4,
+            EngineKind::Basis128 | EngineKind::Basis160 => 4,
         }
     }
 
@@ -607,6 +672,13 @@ impl GpuWorkerEngine {
                     VARIANT_NAMES_DIRECT_BW[idx % 3]
                 } else {
                     VARIANT_NAMES_DIRECT_ADA[idx % 3]
+                }
+            }
+            EngineKind::Basis128 => {
+                if self.info.is_blackwell() {
+                    VARIANT_NAMES_B128_BW[idx % 4]
+                } else {
+                    VARIANT_NAMES_B128_ADA[idx % 4]
                 }
             }
             EngineKind::Basis160 => {
@@ -620,12 +692,13 @@ impl GpuWorkerEngine {
     }
 
     pub fn layout_summary(&self) -> String {
+        let pin_mib = (self.l2_pinned_bytes as f64) / 1048576.0;
         match &self.backend {
             EngineBackend::DirectL2 { panel_m_tiles, .. } => {
                 let b_mib = (self.profile.n * self.profile.k) as f64 / 1048576.0;
                 let a_mib = (panel_m_tiles * 128 * self.profile.k) as f64 / 1048576.0;
                 format!(
-                    "Hyper-L2 Direct ({}x{}x{}, B={:.1}MiB+Apanel={:.1}MiB={:.1}MiB in {:.0}MiB L2, panel_m={} tiles)",
+                    "Hyper-L2 Direct ({}x{}x{}, B={:.1}MiB+Apanel={:.1}MiB={:.1}MiB in {:.0}MiB L2, L2pin={:.1}MiB, panel_m={} tiles)",
                     self.profile.sampled_m(),
                     self.profile.n,
                     self.profile.k,
@@ -633,15 +706,25 @@ impl GpuWorkerEngine {
                     a_mib,
                     b_mib + a_mib,
                     self.info.l2_bytes as f64 / 1048576.0,
+                    pin_mib,
                     panel_m_tiles
                 )
             }
-            EngineBackend::Basis160 { .. } => {
+            EngineBackend::Basis { .. } => {
+                let tag = if self.engine_kind == EngineKind::Basis128 {
+                    "Uniform-3 Basis-128x256"
+                } else {
+                    "Legacy Basis-160x256"
+                };
+                let bas_mib = ((self.profile.m + self.profile.n) * 128) as f64 / 1048576.0;
                 format!(
-                    "Basis-160x256 ({}x{}x{}, L2 basis 8.5MiB)",
+                    "{tag} ({}x{}x{}, L2 basis={:.2}MiB, L2pin={:.2}MiB in {:.0}MiB L2)",
                     self.profile.sampled_m(),
                     self.profile.n,
-                    self.profile.k
+                    self.profile.k,
+                    bas_mib,
+                    pin_mib,
+                    self.info.l2_bytes as f64 / 1048576.0
                 )
             }
         }
@@ -685,7 +768,7 @@ impl GpuWorkerEngine {
             EngineBackend::DirectL2 { fn_merkle_leaves, fn_merkle_parents, fn_gen_basis, .. } => {
                 (*fn_merkle_leaves, *fn_merkle_parents, *fn_gen_basis)
             }
-            EngineBackend::Basis160 { fn_merkle_leaves, fn_merkle_parents, fn_gen_basis, .. } => {
+            EngineBackend::Basis { fn_merkle_leaves, fn_merkle_parents, fn_gen_basis, .. } => {
                 (*fn_merkle_leaves, *fn_merkle_parents, *fn_gen_basis)
             }
         };
@@ -754,7 +837,7 @@ impl GpuWorkerEngine {
         // Upload `key_b` and generate packed `d_bas_b` once per job
         check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_key_b.ptr, cache.key_b.as_ptr() as *const c_void, 32, self.stream) }, "HtoD(key_b)")?;
         let mut p_kb = self.d_key_b.ptr;
-        let mut p_bas_b = self.d_bas_b.ptr;
+        let mut p_bas_b = self.bas_b_ptr();
         let mut rows_b = self.profile.n as i32;
         let mut is_b: i32 = 1;
         let mut args_bb: [*mut c_void; 4] = [
@@ -818,7 +901,7 @@ impl GpuWorkerEngine {
                 "apx_gen_u16_pairs(B)",
             )?;
 
-            let mut p_bb = self.d_bas_b.ptr;
+            let mut p_bb = self.bas_b_ptr();
             let mut p_pb2 = d_pairs_b.ptr;
             let mut p_out_b = d_panel_b.ptr;
             let mut start_frag: i32 = 0;
@@ -885,7 +968,7 @@ impl GpuWorkerEngine {
             } => {
                 let sampled_m = self.profile.sampled_m() as i32;
                 let mut p_ka = self.d_key_a.ptr;
-                let mut p_bas_a = self.d_bas_a.ptr;
+                let mut p_bas_a = self.bas_a_ptr();
                 let mut rows_a = sampled_m;
                 let mut is_b_zero: i32 = 0;
                 let mut args_ba: [*mut c_void; 4] = [
@@ -960,7 +1043,7 @@ impl GpuWorkerEngine {
                     let cur_m = (*panel_m_tiles).min(total_m_tiles - base_bm);
 
                     // 1. Materialize swizzled A panel into L2 cache (~0.015 ms)
-                    let mut p_ba = self.d_bas_a.ptr;
+                    let mut p_ba = self.bas_a_ptr();
                     let mut p_pa2 = d_pairs_a.ptr;
                     let mut p_out_a = d_panel_a.ptr;
                     let mut start_frag = (base_bm * 8) as i32;
@@ -1053,17 +1136,18 @@ impl GpuWorkerEngine {
                     aborted,
                 })
             }
-            EngineBackend::Basis160 {
+            EngineBackend::Basis {
                 fn_gen_basis,
                 fn_gen_raw_pairs,
                 fn_reorder_pairs,
                 fn_variants,
+                smem_bytes,
                 d_pairs,
                 ..
             } => {
                 let sampled_m = self.profile.sampled_m() as i32;
                 let mut p_ka = self.d_key_a.ptr;
-                let mut p_bas_a = self.d_bas_a.ptr;
+                let mut p_bas_a = self.bas_a_ptr();
                 let mut rows_a = sampled_m;
                 let mut is_b_zero: i32 = 0;
                 let mut args_ba: [*mut c_void; 4] = [
@@ -1139,8 +1223,8 @@ impl GpuWorkerEngine {
                 check_cu(api, unsafe { (api.cuEventRecord)(self.ev_start, self.stream) }, "cuEventRecord(start)")?;
 
                 let mut kparams = ApxBasisParams {
-                    bas_a: self.d_bas_a.ptr,
-                    bas_b: self.d_bas_b.ptr,
+                    bas_a: self.bas_a_ptr(),
+                    bas_b: self.bas_b_ptr(),
                     pairs: d_pairs.ptr,
                     sampled_m,
                     n: self.profile.n as i32,
@@ -1161,7 +1245,7 @@ impl GpuWorkerEngine {
                             fn_variants[variant_idx % 4],
                             self.info.sm_count as c_uint, 1, 1,
                             256, 1, 1,
-                            SMEM_BASIS_BYTES as c_uint,
+                            *smem_bytes as c_uint,
                             self.stream,
                             launch_args.as_mut_ptr(),
                             std::ptr::null_mut(),

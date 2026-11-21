@@ -57,11 +57,11 @@ struct Cli {
     #[arg(long, visible_alias = "password", default_value = "auto")]
     pass: String,
 
-    /// Compute engine (`direct` = v0.2 Hyper-L2 Direct 2-CTA/SM [default], `basis` = v0.1 Basis-160x256)
-    #[arg(long, default_value = "direct")]
+    /// Compute engine (`basis128` = v0.3 Uniform-3 L2-Pinned 128x256 [default], `basis160` = v0.1, `direct` = v0.2)
+    #[arg(long, default_value = "basis128")]
     engine: String,
 
-    /// Inner matrix dimension K (defaults: `4096` for `direct`, `16384` for `basis`)
+    /// Inner matrix dimension K (defaults: `16384` for `basis128`/`basis160`, `4096` for `direct`)
     #[arg(long)]
     k: Option<usize>,
 
@@ -162,14 +162,35 @@ fn select_gpus(filter: Option<&str>) -> Result<Vec<GpuDeviceInfo>> {
 
 fn parse_engine(raw: &str) -> Result<EngineKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
+        "basis128" | "b128" | "uniform3" | "u3" => Ok(EngineKind::Basis128),
+        "basis160" | "basis" | "legacy" => Ok(EngineKind::Basis160),
         "direct" | "hyper-l2" | "hl2" | "l2" => Ok(EngineKind::DirectL2),
-        "basis" | "basis160" | "legacy" => Ok(EngineKind::Basis160),
-        other => anyhow::bail!("Unsupported --engine '{other}'; expected 'direct' or 'basis'"),
+        other => anyhow::bail!("Unsupported --engine '{other}'; expected 'basis128', 'basis160', or 'direct'"),
     }
 }
 
 fn build_profile(gpus: &[GpuDeviceInfo], engine: EngineKind, k_opt: Option<usize>, gzip_v2: bool) -> Result<KernelProfile> {
     match engine {
+        EngineKind::Basis128 => {
+            let raw_k = k_opt.unwrap_or(16384);
+            let active_k = if !gzip_v2 && raw_k > 4096 {
+                println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096 to fit plain proof limit");
+                4096
+            } else {
+                raw_k
+            };
+            KernelProfile::basis_128x256(active_k)
+        }
+        EngineKind::Basis160 => {
+            let raw_k = k_opt.unwrap_or(16384);
+            let active_k = if !gzip_v2 && raw_k > 4096 {
+                println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096 to fit plain proof limit");
+                4096
+            } else {
+                raw_k
+            };
+            KernelProfile::basis_160x256(active_k)
+        }
         EngineKind::DirectL2 => {
             let raw_k = k_opt.unwrap_or(4096);
             let active_k = if !gzip_v2 && raw_k > 4096 {
@@ -186,16 +207,6 @@ fn build_profile(gpus: &[GpuDeviceInfo], engine: EngineKind, k_opt: Option<usize
                 .unwrap_or(32 * 1024 * 1024);
             let n = optimal_direct_l2_n(min_l2, active_k);
             KernelProfile::direct_l2_128x128(32768, n, active_k)
-        }
-        EngineKind::Basis160 => {
-            let raw_k = k_opt.unwrap_or(16384);
-            let active_k = if !gzip_v2 && raw_k > 4096 {
-                println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096 to fit plain proof limit");
-                4096
-            } else {
-                raw_k
-            };
-            KernelProfile::basis_160x256(active_k)
         }
     }
 }
@@ -293,12 +304,14 @@ fn verify_selftest_profile(gpus: &[GpuDeviceInfo], cli: &Cli, label: &str, profi
 /// 3. Cross-checks GPU hit digests against exact CPU `cpu_eval_group_digest`.
 /// 4. Verifies full `PlainProof` via official `zk-pow::verify_plain_proof` + `gzip`!
 fn run_hardware_selftest(gpus: &[GpuDeviceInfo], cli: &Cli) -> Result<()> {
-    println!("[selftest] Starting dual-engine hardware + zk-pow verification across {} GPU(s)...", gpus.len());
-    // 1. v0.2 Hyper-L2 Direct rectangular M > N shape (1024x512x2048: n_tiles=4 even for v2 3-stage too!)
-    verify_selftest_profile(gpus, cli, "direct-l2", KernelProfile::direct_l2_128x128(1024, 512, 2048)?)?;
-    // 2. v0.1 Basis-160x256 shape (1024x1024x2048)
+    println!("[selftest] Starting triple-engine hardware + zk-pow verification across {} GPU(s)...", gpus.len());
+    // 1. v0.3 Uniform-3 Basis-128x256 (default engine! K=4096 exercises stp>=16 rotl_xor<13> fold too!)
+    verify_selftest_profile(gpus, cli, "basis-128", KernelProfile::with_dims_128x256(1024, 1024, 4096)?)?;
+    // 2. v0.1 Legacy Basis-160x256
     verify_selftest_profile(gpus, cli, "basis-160", KernelProfile::with_dims(1024, 1024, 2048)?)?;
-    println!("[selftest] ALL CHECKS PASSED (BIT-EXACT GPU == CPU == ZK-POW V3 FOR BOTH ENGINES)!");
+    // 3. v0.2 Hyper-L2 Direct rectangular M > N
+    verify_selftest_profile(gpus, cli, "direct-l2", KernelProfile::direct_l2_128x128(1024, 512, 2048)?)?;
+    println!("[selftest] ALL CHECKS PASSED (BIT-EXACT GPU == CPU == ZK-POW V3 FOR ALL 3 ENGINES)!");
     Ok(())
 }
 
@@ -547,8 +560,9 @@ fn main() -> Result<()> {
     let profile = build_profile(&gpus, engine, cli.k, session.gzip_v2)?;
     let active_k = profile.k;
     let engine_tag = match engine {
+        EngineKind::Basis128 => "b128",
+        EngineKind::Basis160 => "b160",
         EngineKind::DirectL2 => "direct",
-        EngineKind::Basis160 => "basis",
     };
 
     let global_epoch = Arc::new(AtomicU32::new(1));
@@ -582,7 +596,7 @@ fn main() -> Result<()> {
         )?;
         let cache = eng.prepare_job(&first_prep, 1)?;
         let tune_key = format!(
-            "v02_{}_{}_sm{}{}_n{}_k{}",
+            "v03_{}_{}_sm{}{}_n{}_k{}",
             engine_tag, info.name, info.sm_major, info.sm_minor, profile.n, active_k
         );
         if let Some(&cached_v) = tune_db.entries.get(&tune_key) {

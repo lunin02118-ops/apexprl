@@ -27,9 +27,34 @@ pub const CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE: c_int = 38;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 pub const CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE: c_int = 108;
+pub const CU_DEVICE_ATTRIBUTE_MAX_ACCESS_POLICY_WINDOW_SIZE: c_int = 109;
 
 pub const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
+pub const CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT: c_int = 9;
 pub const CU_LIMIT_PERSISTING_L2_CACHE_SIZE: c_int = 0x06;
+
+pub const CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW: c_int = 1;
+pub const CU_ACCESS_PROPERTY_NORMAL: c_int = 0;
+pub const CU_ACCESS_PROPERTY_STREAMING: c_int = 1;
+pub const CU_ACCESS_PROPERTY_PERSISTING: c_int = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUaccessPolicyWindow {
+    pub base_ptr: *mut c_void,
+    pub num_bytes: usize,
+    pub hit_ratio: f32,
+    pub hit_prop: c_int,
+    pub miss_prop: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union CUstreamAttrValue {
+    pub pad: [u8; 64],
+    pub access_policy_window: CUaccessPolicyWindow,
+}
+const _: () = assert!(std::mem::size_of::<CUstreamAttrValue>() == 64);
 
 pub struct CudaApi {
     pub cuInit: unsafe extern "C" fn(c_uint) -> CUresult,
@@ -65,6 +90,7 @@ pub struct CudaApi {
     pub cuMemcpyDtoHAsync_v2: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
     pub cuMemcpyDtoH_v2: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult,
     pub cuStreamCreate: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
+    pub cuStreamSetAttribute: Option<unsafe extern "C" fn(CUstream, c_int, *const CUstreamAttrValue) -> CUresult>,
     pub cuStreamSynchronize: unsafe extern "C" fn(CUstream) -> CUresult,
     pub cuStreamDestroy_v2: unsafe extern "C" fn(CUstream) -> CUresult,
     pub cuEventCreate: unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult,
@@ -135,6 +161,7 @@ fn init_cuda_api() -> Result<CudaApi, String> {
             cuMemcpyDtoHAsync_v2: load_sym(handle, "cuMemcpyDtoHAsync_v2")?,
             cuMemcpyDtoH_v2: load_sym(handle, "cuMemcpyDtoH_v2")?,
             cuStreamCreate: load_sym(handle, "cuStreamCreate")?,
+            cuStreamSetAttribute: load_sym(handle, "cuStreamSetAttribute").ok(),
             cuStreamSynchronize: load_sym(handle, "cuStreamSynchronize")?,
             cuStreamDestroy_v2: load_sym(handle, "cuStreamDestroy_v2")?,
             cuEventCreate: load_sym(handle, "cuEventCreate")?,

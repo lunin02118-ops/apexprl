@@ -167,9 +167,9 @@ __device__ __forceinline__ unsigned maxnib(unsigned h) {
 
 // Greedy bank-conflict-aware column permutation inside each 128-column K-chunk (mathematically invariant!).
 // On SM89, also applies the lane->k_col permutation for `ldmatrix.m8n8.x4.trans.shared.b16`.
-template <bool PERMUTE_SM89>
+template <bool PERMUTE_SM89, int WA = 10>
 __device__ __forceinline__ void reorder_pairs_body(uint2 *__restrict__ pairs, int k, bool enable_greedy) {
-  constexpr int W[4] = {10, 10, 16, 16};
+  constexpr int W[4] = {WA, WA, 16, 16};
   __shared__ uint2 sp[4][128];
   __shared__ uint2 sgrouped[4][128];
   __shared__ uint32_t scol[4][128];

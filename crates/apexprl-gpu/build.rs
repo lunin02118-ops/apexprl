@@ -41,7 +41,23 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| cuda_home.join("bin/nvcc"));
 
-    // Hyper-L2 Direct 2-CTA/SM cubins (v0.2 default engine!)
+    // Uniform-3 On-Chip L2-Pinned Basis 128x256 cubins (v0.3 default engine: 0 spills, 0 GB/s DRAM at 810 MHz!)
+    compile_cubin(
+        &nvcc,
+        &kernels_dir.join("apexprl_b128_sm89.cu"),
+        "sm_89",
+        "-O1",
+        &out_dir.join("apexprl_b128_sm89.cubin"),
+    );
+    compile_cubin(
+        &nvcc,
+        &kernels_dir.join("apexprl_b128_sm120a.cu"),
+        "sm_120a",
+        "-O1",
+        &out_dir.join("apexprl_b128_sm120a.cubin"),
+    );
+
+    // Hyper-L2 Direct 2-CTA/SM cubins (`--engine direct`)
     compile_cubin(
         &nvcc,
         &kernels_dir.join("apexprl_direct_sm89.cu"),
