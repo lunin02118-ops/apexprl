@@ -8,10 +8,12 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/root/apexprl-target}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-echo "=== [1/4] Auditing CUDA SASS Kernels (v0.3 Uniform-3 Basis-128 + Direct-L2 + Legacy Basis-160; SM89 & SM120a) ==="
+echo "=== [1/4] Auditing CUDA SASS Kernels (v0.5 Basis-128 + EDCP-120 + Direct-L2 + Legacy Basis-160; SM89 & SM120a) ==="
 mkdir -p /root/apexprl-cubins
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_89   -Xptxas -O1,-v --cubin kernels/apexprl_b128_sm89.cu     -o /root/apexprl-cubins/apexprl_b128_sm89.cubin
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_120a -Xptxas -O1,-v --cubin kernels/apexprl_b128_sm120a.cu   -o /root/apexprl-cubins/apexprl_b128_sm120a.cubin
+nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_89   -Xptxas -O3,-v --cubin kernels/apexprl_edcp_sm89.cu     -o /root/apexprl-cubins/apexprl_edcp_sm89.cubin
+nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_120a -Xptxas -O1,-v --cubin kernels/apexprl_edcp_sm120a.cu   -o /root/apexprl-cubins/apexprl_edcp_sm120a.cubin
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_89   -Xptxas -O3,-v --cubin kernels/apexprl_direct_sm89.cu   -o /root/apexprl-cubins/apexprl_direct_sm89.cubin
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_120a -Xptxas -O1,-v --cubin kernels/apexprl_direct_sm120a.cu -o /root/apexprl-cubins/apexprl_direct_sm120a.cubin
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_89   -Xptxas -O1,-v --cubin kernels/apexprl_sm89.cu          -o /root/apexprl-cubins/apexprl_sm89.cubin

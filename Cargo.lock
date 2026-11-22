@@ -106,7 +106,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apexprl-cli"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "apexprl-gpu",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "apexprl-gpu"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "apexprl-pow",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "apexprl-pow"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "apexprl-stratum"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "apexprl-pow",

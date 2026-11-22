@@ -1,14 +1,18 @@
-//! Multi-GPU CUDA Driver API & NVML engine for ApexPRL v0.2
-//! Supports BOTH:
-//!   - **Hyper-L2 Direct 2-CTA/SM Engine (`direct`, default):** `128x128` CTA, 2 CTAs/SM, SWAR warp-transpose
-//!     L2 materializer, 0 register spills, `elect.sync` TMA on Blackwell (`sm_120a`), `-O3` on Ada (`sm_89`).
-//!   - **On-Chip Basis Engine (`basis`):** `160x256` CTA, 1 CTA/SM, L2-resident `8.5 MiB` basis rebuild.
+//! Multi-GPU CUDA Driver API & NVML engine for ApexPRL v0.4.0
+//! Supports four 100% bit-exact engines:
+//!   - **Uniform-3 Basis 128x256 (`basis128`, default):** Wavefront-exact unscrambled (`sm_89`) / 16-lane (`sm_120a`)
+//!     + 4-pass 2-opt pair reorderer, L2-pinned `8.38 MiB` basis, `0.00 GB/s` DRAM at `810 MHz` GDDR7.
+//!   - **Hyper-L2 Direct 2-CTA/SM (`direct`):** Zero-eviction `PERSISTING + NORMAL` L2 sizing (`K=2048` default),
+//!     2 CTAs/SM, `elect.sync` TMA on Blackwell (`sm_120a`), `-O3` on Ada (`sm_89`).
+//!   - **Zero-Outlier EDCP-120 (`edcp`):** Kirchhoff-Poincare Edge-Disjoint Cycle Packing (`Constant-0`, `b_salt`),
+//!     `3xIMMA.16832 + 1xIMMA.16816 + 2xDP4A`, `0` outliers, 2 CTAs/SM.
+//!   - **Legacy On-Chip Basis (`basis160`):** `160x256` CTA, 1 CTA/SM.
 
 pub mod cuda_drv;
 pub mod nvml_drv;
 
 use anyhow::{bail, ensure, Context, Result};
-use apexprl_pow::{Constant64MerkleCache, KernelProfile, PreparedJob};
+use apexprl_pow::{Constant64MerkleCache, EdcpColSpec, KernelProfile, PreparedJob};
 use cuda_drv::*;
 use nvml_drv::{GpuSensors, NvmlHandle};
 use serde::{Deserialize, Serialize};
@@ -17,10 +21,14 @@ use std::ffi::{c_int, c_uint, c_void, CStr, CString};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+const _: () = assert!(std::mem::size_of::<EdcpColSpec>() == 4);
+
 const CUBIN_B128_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_b128_sm89.cubin"));
 const CUBIN_B128_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_b128_sm120a.cubin"));
 const CUBIN_DIRECT_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_direct_sm89.cubin"));
 const CUBIN_DIRECT_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_direct_sm120a.cubin"));
+const CUBIN_EDCP_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_edcp_sm89.cubin"));
+const CUBIN_EDCP_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_edcp_sm120a.cubin"));
 const CUBIN_BASIS_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_sm89.cubin"));
 const CUBIN_BASIS_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_sm120a.cubin"));
 
@@ -28,11 +36,14 @@ pub const SMEM_BASIS128_BYTES: c_int = 90240; // 16KiB A + 32KiB B + 2*12KiB sta
 pub const SMEM_BASIS_BYTES: c_int = 96320;
 pub const SMEM_DIRECT_2CTA_BYTES: c_int = 41088; // 2 * 16384 + 8192 + 128 (x2 CTAs/SM = 82,176 B <= 99 KiB)
 pub const SMEM_DIRECT_3STG_BYTES: c_int = 90240; // 3 * 24576 + 16384 + 128
+pub const SMEM_EDCP_2CTA_BYTES: c_int = 39040; // 16384 + 14336 + 8192 + 128 (x2 CTAs/SM = 78,080 B <= 99 KiB)
 
-pub const VARIANT_NAMES_B128_ADA: [&str; 4] = ["ada128-c9", "ada128-c8", "ada128-c0", "ada128-c6"];
-pub const VARIANT_NAMES_B128_BW: [&str; 4] = ["bw128-c9", "bw128-c8", "bw128-c0", "bw128-c6"];
+pub const VARIANT_NAMES_B128_ADA: [&str; 4] = ["ada128-e2", "ada128-e1", "ada128-c6", "ada128-c9"];
+pub const VARIANT_NAMES_B128_BW: [&str; 4] = ["bw128-e2", "bw128-c9", "bw128-c8", "bw128-c0"];
 pub const VARIANT_NAMES_DIRECT_ADA: [&str; 3] = ["hl2-2cta", "hl2-2cta-s2", "hl2-3stg"];
 pub const VARIANT_NAMES_DIRECT_BW: [&str; 3] = ["hl2-2cta", "hl2-2cta-df", "hl2-3stg"];
+pub const VARIANT_NAMES_EDCP_ADA: [&str; 2] = ["edcp-2cta", "edcp-2cta-s2"];
+pub const VARIANT_NAMES_EDCP_BW: [&str; 2] = ["edcp-tma-2cta", "edcp-tma-s2"];
 pub const VARIANT_NAMES_BASIS_ADA: [&str; 4] = ["ada-u6", "ada-y5m1", "ada-u10", "ada-early"];
 pub const VARIANT_NAMES_BASIS_BW: [&str; 4] = ["bw-u6", "bw-y5m1", "bw-w5q21", "bw-u10"];
 
@@ -41,6 +52,7 @@ pub enum EngineKind {
     Basis128,
     Basis160,
     DirectL2,
+    Edcp120,
 }
 
 #[repr(C)]
@@ -108,10 +120,11 @@ impl GpuDeviceInfo {
     }
 }
 
-/// Computes optimal L2-resident `N` dimension (`4096`, `8192`, or `16384`) for Direct-L2 mode
-/// based on the minimum L2 cache size across active GPUs so `d_panel_b` stays 100% resident in L2!
+/// Computes optimal L2-resident `N` dimension (`2048`..=`16384`) for Direct-L2 mode
+/// keeping `d_panel_b <= 50%` of L2 so `d_panel_b` stays 100% pinned in `PERSISTING` L2
+/// while `d_panel_a` + `d_bas_a` stream in `NORMAL` L2 with zero `810 MHz` GDDR7 evictions!
 pub fn optimal_direct_l2_n(min_l2_bytes: usize, k: usize) -> usize {
-    let target_b_bytes = (min_l2_bytes * 70) / 100; // leave >=30% of L2 for streaming A panels!
+    let target_b_bytes = (min_l2_bytes * 50) / 100;
     let mut n = 16384usize;
     while n > 1024 && n * k > target_b_bytes {
         n >>= 1;
@@ -119,28 +132,49 @@ pub fn optimal_direct_l2_n(min_l2_bytes: usize, k: usize) -> usize {
     n.clamp(2048, 16384)
 }
 
-/// Computes wave-aligned `panel_m_tiles` (`128`-row tiles) that fits inside the remaining L2 cache
-/// alongside `d_panel_b` and maximizes 2-CTA/SM wave efficiency (`2 * sm_count` CTAs/wave)!
-pub fn optimal_panel_m_tiles(info: &GpuDeviceInfo, profile: &KernelProfile) -> usize {
-    let total_m_tiles = profile.sampled_m() / 128;
-    let n_tiles = profile.n / 128;
-    let b_bytes = profile.n * profile.k;
-    let tile_a_bytes = 128 * profile.k;
+/// Computes optimal L2-resident `N` dimension (`2048`..=`16384`) for EDCP-120 mode (`15,360 B` per chunk tile).
+pub fn optimal_edcp_n(min_l2_bytes: usize, k: usize) -> usize {
+    let target_b_bytes = (min_l2_bytes * 50) / 100;
+    let num_chunks = k / 128;
+    let mut n = 16384usize;
+    while n > 1024 && ((n.saturating_sub(256) / 128) * num_chunks * 15360) > target_b_bytes {
+        n >>= 1;
+    }
+    n.clamp(2048, 16384)
+}
 
-    let l2_budget = ((info.l2_bytes as f64) * 0.81) as usize;
-    let avail_a_bytes = l2_budget.saturating_sub(b_bytes).max(tile_a_bytes * 4);
-    let max_m = (avail_a_bytes / tile_a_bytes).clamp(4, total_m_tiles.min(32));
+/// Computes round-wide wave-optimal `panel_m_tiles` (`128`-row tiles) fitting inside the `NORMAL` L2 budget
+/// alongside `PERSISTING` `d_panel_b`, maximizing 2-CTA/SM wave efficiency across ALL `total_m_tiles`!
+pub fn optimal_panel_m_tiles(info: &GpuDeviceInfo, profile: &KernelProfile) -> usize {
+    let total_m_tiles = (profile.sampled_m() / 128).max(1);
+    let n_tiles = (profile.sampled_n() / 128).max(1);
+    let tile_bytes = if profile.is_edcp() {
+        (profile.k / 128) * 15360
+    } else {
+        128 * profile.k
+    };
+    let b_bytes = n_tiles * tile_bytes;
+
+    let l2_budget = ((info.l2_bytes as f64) * 0.70) as usize;
+    let avail_a_bytes = l2_budget.saturating_sub(b_bytes).max(tile_bytes * 4);
+    let max_m = (avail_a_bytes / tile_bytes).clamp(4, total_m_tiles.min(40));
     let min_m = 8usize.min(max_m);
 
     let wave_ctas = (info.sm_count as usize * 2).max(1);
     let mut best_m = max_m;
     let mut best_score = -1.0f64;
     for m_t in min_m..=max_m {
-        let ctas = m_t * n_tiles;
-        let waves = ctas.div_ceil(wave_ctas);
-        let wave_eff = (ctas as f64) / ((waves * wave_ctas) as f64);
-        // Slightly prefer larger panels (fewer launches) when wave efficiency is tied
-        let score = wave_eff + (m_t as f64) * 1e-4;
+        let full_panels = total_m_tiles / m_t;
+        let rem_m = total_m_tiles % m_t;
+        let total_waves = full_panels * (m_t * n_tiles).div_ceil(wave_ctas)
+            + if rem_m > 0 {
+                (rem_m * n_tiles).div_ceil(wave_ctas)
+            } else {
+                0
+            };
+        let num_launches = full_panels + usize::from(rem_m > 0);
+        let round_wave_eff = ((total_m_tiles * n_tiles) as f64) / ((total_waves * wave_ctas) as f64);
+        let score = round_wave_eff - (num_launches as f64) * 0.0005;
         if score > best_score {
             best_score = score;
             best_m = m_t;
@@ -299,6 +333,17 @@ impl MappedControlPage {
         self.dev_ptr + 68
     }
 
+    /// Writes `key_a` into bytes `32..64` of this page-locked pinned control page and returns its host pointer
+    /// for 100% non-blocking async DMA (`cuMemcpyHtoDAsync_v2`).
+    #[inline]
+    pub fn write_pinned_key_a(&self, key_a: &[u8; 32]) -> *const c_void {
+        unsafe {
+            let dst = self.host_ptr.add(32);
+            std::ptr::copy_nonoverlapping(key_a.as_ptr(), dst, 32);
+            dst as *const c_void
+        }
+    }
+
     pub fn read_hits(&self, hit_cap: usize) -> (u32, Vec<u32>) {
         unsafe {
             let count = std::ptr::read_volatile((self.host_ptr.add(64)) as *const u32);
@@ -361,6 +406,13 @@ fn bytes32_to_u32x8(b: &[u8; 32]) -> [u32; 8] {
     out
 }
 
+#[derive(Clone, Copy)]
+struct InflightBasisRound {
+    slot: usize,
+    nonce: u64,
+    epoch: u32,
+}
+
 enum EngineBackend {
     DirectL2 {
         _module: CUmodule,
@@ -376,16 +428,41 @@ enum EngineBackend {
         d_panel_b: DevMem,
         panel_m_tiles: usize,
     },
+    Edcp {
+        _module: CUmodule,
+        fn_merkle_leaves: CUfunction,
+        fn_merkle_parents: CUfunction,
+        fn_gen_basis: CUfunction,
+        fn_prepare_a: CUfunction,
+        fn_materialize_b: CUfunction,
+        fn_materialize_a: CUfunction,
+        fn_variants: [CUfunction; 2],
+        d_bpairs_120: DevMem,
+        d_specs_120: DevMem,
+        d_apairs2_120: DevMem,
+        d_panel_a: DevMem,
+        d_panel_b: DevMem,
+        panel_m_tiles: usize,
+    },
     Basis {
         _module: CUmodule,
         fn_merkle_leaves: CUfunction,
         fn_merkle_parents: CUfunction,
         fn_gen_basis: CUfunction,
-        fn_gen_raw_pairs: CUfunction,
+        fn_gen_b_pairs: CUfunction,
+        fn_gen_ab_pairs: CUfunction,
         fn_reorder_pairs: CUfunction,
         fn_variants: [CUfunction; 4],
         smem_bytes: c_int,
+        d_bpairs: DevMem,
         d_pairs: DevMem,
+        d_pairs_alt: DevMem,
+        d_key_a_alt: DevMem,
+        ctrl_alt: MappedControlPage,
+        ev_alt_round_start: CUevent,
+        ev_alt_start: CUevent,
+        ev_alt_end: CUevent,
+        inflight: Option<InflightBasisRound>,
     },
 }
 
@@ -476,7 +553,9 @@ impl GpuWorkerEngine {
             info.sm_minor
         );
 
-        let engine_kind = if profile.is_direct_l2() {
+        let engine_kind = if profile.is_edcp() {
+            EngineKind::Edcp120
+        } else if profile.is_direct_l2() {
             EngineKind::DirectL2
         } else if profile.is_basis_128() {
             EngineKind::Basis128
@@ -551,7 +630,7 @@ impl GpuWorkerEngine {
                 let d_panel_b = DevMem::alloc(api, profile.n * profile.k)?;
                 l2_pinned_bytes = pin_l2_window(api, dev, stream, d_panel_b.ptr, profile.n * profile.k);
 
-                EngineBackend::DirectL2 {
+                    EngineBackend::DirectL2 {
                     _module: module,
                     fn_merkle_leaves,
                     fn_merkle_parents,
@@ -561,6 +640,67 @@ impl GpuWorkerEngine {
                     fn_variants: [fn_v0, fn_v1, fn_v2],
                     d_pairs_a,
                     d_pairs_b,
+                    d_panel_a,
+                    d_panel_b,
+                    panel_m_tiles,
+                }
+            }
+            EngineKind::Edcp120 => {
+                let cubin = if info.is_blackwell() { CUBIN_EDCP_SM120A } else { CUBIN_EDCP_SM89 };
+                let mut module = std::ptr::null_mut();
+                check_cu(
+                    api,
+                    unsafe { (api.cuModuleLoadData)(&mut module, cubin.as_ptr() as *const c_void) },
+                    "cuModuleLoadData(edcp)",
+                )?;
+                let get_fn = |name: &str| -> Result<CUfunction> {
+                    let cs = CString::new(name).unwrap();
+                    let mut f = std::ptr::null_mut();
+                    check_cu(api, unsafe { (api.cuModuleGetFunction)(&mut f, module, cs.as_ptr()) }, name)?;
+                    Ok(f)
+                };
+                let fn_merkle_leaves = get_fn("apx_merkle_leaves_const0")?;
+                let fn_merkle_parents = get_fn("apx_merkle_parents")?;
+                let fn_gen_basis = get_fn("apx_gen_basis_linear")?;
+                let fn_prepare_a = get_fn("apx_prepare_edcp_a")?;
+                let fn_materialize_b = get_fn("apx_materialize_edcp_b")?;
+                let fn_materialize_a = get_fn("apx_materialize_edcp_a")?;
+                let fn_v0 = get_fn("apx_edcp_v0")?;
+                let fn_v1 = get_fn("apx_edcp_v1")?;
+
+                for &f in &[fn_v0, fn_v1] {
+                    check_cu(
+                        api,
+                        unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_EDCP_2CTA_BYTES) },
+                        "smem(edcp)",
+                    )?;
+                    let _ = unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100) };
+                }
+
+                let num_chunks = profile.k / 128;
+                let n_tiles = profile.sampled_n() / 128;
+                let panel_m_tiles = optimal_panel_m_tiles(&info, &profile);
+                let panel_b_bytes = n_tiles * num_chunks * 15360;
+                let panel_a_bytes = panel_m_tiles * num_chunks * 15360;
+                let d_bpairs_120 = DevMem::alloc(api, num_chunks * 120 * 2)?;
+                let d_specs_120 = DevMem::alloc(api, num_chunks * 120 * 4)?;
+                let d_apairs2_120 = DevMem::alloc(api, num_chunks * 120 * 4)?;
+                let d_panel_a = DevMem::alloc(api, panel_a_bytes)?;
+                let d_panel_b = DevMem::alloc(api, panel_b_bytes)?;
+                l2_pinned_bytes = pin_l2_window(api, dev, stream, d_panel_b.ptr, panel_b_bytes);
+
+                EngineBackend::Edcp {
+                    _module: module,
+                    fn_merkle_leaves,
+                    fn_merkle_parents,
+                    fn_gen_basis,
+                    fn_prepare_a,
+                    fn_materialize_b,
+                    fn_materialize_a,
+                    fn_variants: [fn_v0, fn_v1],
+                    d_bpairs_120,
+                    d_specs_120,
+                    d_apairs2_120,
                     d_panel_a,
                     d_panel_b,
                     panel_m_tiles,
@@ -590,7 +730,8 @@ impl GpuWorkerEngine {
                 let fn_merkle_leaves = get_fn("apx_merkle_leaves_const64")?;
                 let fn_merkle_parents = get_fn("apx_merkle_parents")?;
                 let fn_gen_basis = get_fn("apx_gen_basis_arch")?;
-                let fn_gen_raw_pairs = get_fn("apx_gen_raw_pairs")?;
+                let fn_gen_b_pairs = get_fn("apx_gen_b_pairs")?;
+                let fn_gen_ab_pairs = get_fn("apx_gen_ab_pairs_from_b")?;
                 let fn_reorder_pairs = get_fn("apx_reorder_pairs_arch")?;
                 let prefix = if is_b128 { "apx_b128_mine" } else { "apx_basis_mine" };
                 let fn_variants = [
@@ -604,17 +745,36 @@ impl GpuWorkerEngine {
                     check_cu(api, unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_bytes) }, "smem(basis)")?;
                     let _ = unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100) };
                 }
+                let d_bpairs = DevMem::alloc(api, profile.k * 4)?;
                 let d_pairs = DevMem::alloc(api, profile.k * 8)?;
+                let d_pairs_alt = DevMem::alloc(api, profile.k * 8)?;
+                let d_key_a_alt = DevMem::alloc(api, 32)?;
+                let ctrl_alt = MappedControlPage::alloc(api, hit_cap)?;
+                let mut ev_alt_round_start = std::ptr::null_mut();
+                let mut ev_alt_start = std::ptr::null_mut();
+                let mut ev_alt_end = std::ptr::null_mut();
+                check_cu(api, unsafe { (api.cuEventCreate)(&mut ev_alt_round_start, CU_EVENT_BLOCKING_SYNC) }, "cuEventCreate(alt_round)")?;
+                check_cu(api, unsafe { (api.cuEventCreate)(&mut ev_alt_start, CU_EVENT_BLOCKING_SYNC) }, "cuEventCreate(alt_start)")?;
+                check_cu(api, unsafe { (api.cuEventCreate)(&mut ev_alt_end, CU_EVENT_BLOCKING_SYNC) }, "cuEventCreate(alt_end)")?;
                 EngineBackend::Basis {
                     _module: module,
                     fn_merkle_leaves,
                     fn_merkle_parents,
                     fn_gen_basis,
-                    fn_gen_raw_pairs,
+                    fn_gen_b_pairs,
+                    fn_gen_ab_pairs,
                     fn_reorder_pairs,
                     fn_variants,
                     smem_bytes,
+                    d_bpairs,
                     d_pairs,
+                    d_pairs_alt,
+                    d_key_a_alt,
+                    ctrl_alt,
+                    ev_alt_round_start,
+                    ev_alt_start,
+                    ev_alt_end,
+                    inflight: None,
                 }
             }
         };
@@ -661,6 +821,7 @@ impl GpuWorkerEngine {
     pub fn num_variants(&self) -> usize {
         match self.engine_kind {
             EngineKind::DirectL2 => 3,
+            EngineKind::Edcp120 => 2,
             EngineKind::Basis128 | EngineKind::Basis160 => 4,
         }
     }
@@ -672,6 +833,13 @@ impl GpuWorkerEngine {
                     VARIANT_NAMES_DIRECT_BW[idx % 3]
                 } else {
                     VARIANT_NAMES_DIRECT_ADA[idx % 3]
+                }
+            }
+            EngineKind::Edcp120 => {
+                if self.info.is_blackwell() {
+                    VARIANT_NAMES_EDCP_BW[idx % 2]
+                } else {
+                    VARIANT_NAMES_EDCP_ADA[idx % 2]
                 }
             }
             EngineKind::Basis128 => {
@@ -710,9 +878,26 @@ impl GpuWorkerEngine {
                     panel_m_tiles
                 )
             }
+            EngineBackend::Edcp { panel_m_tiles, .. } => {
+                let num_chunks = self.profile.k / 128;
+                let b_mib = ((self.profile.sampled_n() / 128) * num_chunks * 15360) as f64 / 1048576.0;
+                let a_mib = (panel_m_tiles * num_chunks * 15360) as f64 / 1048576.0;
+                format!(
+                    "EDCP-120 Zero-Outlier ({}x{}x{} -> K_eff<=120, B={:.1}MiB+Apanel={:.1}MiB={:.1}MiB in {:.0}MiB L2, L2pin={:.1}MiB, panel_m={} tiles)",
+                    self.profile.sampled_m(),
+                    self.profile.sampled_n(),
+                    self.profile.k,
+                    b_mib,
+                    a_mib,
+                    b_mib + a_mib,
+                    self.info.l2_bytes as f64 / 1048576.0,
+                    pin_mib,
+                    panel_m_tiles
+                )
+            }
             EngineBackend::Basis { .. } => {
                 let tag = if self.engine_kind == EngineKind::Basis128 {
-                    "Uniform-3 Basis-128x256"
+                    "Uniform-3 v0.5 Persistent-A Basis-128x256"
                 } else {
                     "Legacy Basis-160x256"
                 };
@@ -752,28 +937,43 @@ impl GpuWorkerEngine {
             })
     }
 
+    /// Drains any in-flight pipelined CUDA round on `self.stream`.
+    pub fn flush_pipeline(&mut self) -> Result<()> {
+        self.bind_context()?;
+        if let EngineBackend::Basis { inflight, .. } = &mut self.backend {
+            if inflight.take().is_some() {
+                let api = cuda()?;
+                check_cu(api, unsafe { (api.cuStreamSynchronize)(self.stream) }, "cuStreamSynchronize(flush)")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Prepares a new block job on GPU:
     /// 1. Builds the full Constant-64 Merkle heap on GPU (~0.4 ms) and verifies `root_b` on CPU.
-    /// 2. Generates `d_bas_b` once per job.
+    /// 2. Generates `d_bas_b` (and `d_bpairs` in Basis mode!) once per job.
     /// 3. In `DirectL2` mode, pre-materializes the ENTIRE L2-resident `d_panel_b` (`N x K`) ONCE PER JOB!
     pub fn prepare_job(&mut self, job: &PreparedJob, epoch: u32) -> Result<Constant64MerkleCache> {
-        self.bind_context()?;
+        self.flush_pipeline()?;
         self.set_epoch(epoch);
         let api = cuda()?;
 
         check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_job_key.ptr, job.job_key.as_ptr() as *const c_void, 32, self.stream) }, "HtoD(job_key)")?;
         check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_target_le.ptr, job.bound_le.as_ptr() as *const c_void, 32, self.stream) }, "HtoD(target_le)")?;
 
-        let (fn_leaves, fn_parents, fn_gen_basis) = match &self.backend {
-            EngineBackend::DirectL2 { fn_merkle_leaves, fn_merkle_parents, fn_gen_basis, .. } => {
-                (*fn_merkle_leaves, *fn_merkle_parents, *fn_gen_basis)
+        let (fn_leaves, fn_parents) = match &self.backend {
+            EngineBackend::DirectL2 { fn_merkle_leaves, fn_merkle_parents, .. } => {
+                (*fn_merkle_leaves, *fn_merkle_parents)
             }
-            EngineBackend::Basis { fn_merkle_leaves, fn_merkle_parents, fn_gen_basis, .. } => {
-                (*fn_merkle_leaves, *fn_merkle_parents, *fn_gen_basis)
+            EngineBackend::Edcp { fn_merkle_leaves, fn_merkle_parents, .. } => {
+                (*fn_merkle_leaves, *fn_merkle_parents)
+            }
+            EngineBackend::Basis { fn_merkle_leaves, fn_merkle_parents, .. } => {
+                (*fn_merkle_leaves, *fn_merkle_parents)
             }
         };
 
-        let nleaves = (self.profile.m * self.profile.k) / apexprl_pow::CHUNK_BYTES;
+        let nleaves = Constant64MerkleCache::base_heap_leaves(&self.profile);
         let mut p_key = self.d_job_key.ptr;
         let mut p_tree = self.d_tree.ptr;
         let mut nleaves_i32 = nleaves as i32;
@@ -826,19 +1026,54 @@ impl GpuWorkerEngine {
             count >>= 1;
         }
 
-        let heap_len = Constant64MerkleCache::heap_byte_len(&self.profile);
-        let mut heap = vec![0u8; heap_len];
-        check_cu(api, unsafe { (api.cuMemcpyDtoHAsync_v2)(heap.as_mut_ptr() as *mut c_void, self.d_tree.ptr, heap_len, self.stream) }, "DtoH(merkle_heap)")?;
+        let row_heap_len = Constant64MerkleCache::row_heap_byte_len(&self.profile);
+        let mut row_heap = vec![0u8; row_heap_len];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuMemcpyDtoHAsync_v2)(
+                    row_heap.as_mut_ptr() as *mut c_void,
+                    self.d_tree.ptr,
+                    row_heap_len,
+                    self.stream,
+                )
+            },
+            "DtoH(merkle_row_heap)",
+        )?;
         check_cu(api, unsafe { (api.cuStreamSynchronize)(self.stream) }, "cuStreamSynchronize(job)")?;
 
-        let cache = Constant64MerkleCache::from_gpu_heap(job, heap)
-            .context("GPU Merkle heap validation failed")?;
+        let cache = Constant64MerkleCache::from_gpu_row_heap(job, row_heap)
+            .context("GPU Merkle row_heap validation failed")?;
 
-        // Upload `key_b` and generate packed `d_bas_b` once per job
+        self.load_job_with_cache(job, &cache, epoch)?;
+        Ok(cache)
+    }
+
+    /// Loads `job` onto a secondary GPU (`GPU #1..#N`) using `cache` already built on `GPU #0` (`~0.15 ms`,
+    /// `0` Merkle leaf hashes, `0` `810 MHz` GDDR7 `d_tree` writes, `0` PCIe DtoH traffic!).
+    pub fn load_job_with_cache(
+        &mut self,
+        job: &PreparedJob,
+        cache: &Constant64MerkleCache,
+        epoch: u32,
+    ) -> Result<()> {
+        self.flush_pipeline()?;
+        self.set_epoch(epoch);
+        let api = cuda()?;
+
+        check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_job_key.ptr, job.job_key.as_ptr() as *const c_void, 32, self.stream) }, "HtoD(job_key)")?;
+        check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_target_le.ptr, job.bound_le.as_ptr() as *const c_void, 32, self.stream) }, "HtoD(target_le)")?;
         check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_key_b.ptr, cache.key_b.as_ptr() as *const c_void, 32, self.stream) }, "HtoD(key_b)")?;
+
+        let fn_gen_basis = match &self.backend {
+            EngineBackend::DirectL2 { fn_gen_basis, .. } => *fn_gen_basis,
+            EngineBackend::Edcp { fn_gen_basis, .. } => *fn_gen_basis,
+            EngineBackend::Basis { fn_gen_basis, .. } => *fn_gen_basis,
+        };
+        let rows_b_usize = self.profile.sampled_n();
         let mut p_kb = self.d_key_b.ptr;
         let mut p_bas_b = self.bas_b_ptr();
-        let mut rows_b = self.profile.n as i32;
+        let mut rows_b = rows_b_usize as i32;
         let mut is_b: i32 = 1;
         let mut args_bb: [*mut c_void; 4] = [
             (&mut p_kb as *mut CUdeviceptr).cast(),
@@ -851,7 +1086,7 @@ impl GpuWorkerEngine {
             unsafe {
                 (api.cuLaunchKernel)(
                     fn_gen_basis,
-                    (self.profile.n / 16) as c_uint, 1, 1,
+                    (rows_b_usize / 16) as c_uint, 1, 1,
                     64, 1, 1,
                     0,
                     self.stream,
@@ -862,77 +1097,473 @@ impl GpuWorkerEngine {
             "gen_basis(B)",
         )?;
 
-        // In DirectL2 mode: generate `d_pairs_b` and materialize the ENTIRE `d_panel_b` ONCE PER BLOCK!
-        if let EngineBackend::DirectL2 {
-            fn_gen_u16_pairs,
-            fn_materialize_128,
-            d_pairs_a,
-            d_pairs_b,
-            d_panel_b,
-            ..
-        } = &self.backend
-        {
-            let mut p_kb1 = self.d_key_b.ptr;
-            let mut p_kb2 = self.d_key_b.ptr;
-            let mut p_pa = d_pairs_a.ptr;
-            let mut p_pb = d_pairs_b.ptr;
-            let mut k_i32 = self.profile.k as i32;
-            let mut args_up: [*mut c_void; 5] = [
-                (&mut p_kb1 as *mut CUdeviceptr).cast(),
-                (&mut p_kb2 as *mut CUdeviceptr).cast(),
-                (&mut p_pa as *mut CUdeviceptr).cast(),
-                (&mut p_pb as *mut CUdeviceptr).cast(),
-                (&mut k_i32 as *mut i32).cast(),
-            ];
-            let hash_lines = ((self.profile.k / 8) as u32 + 127) / 128;
-            check_cu(
-                api,
-                unsafe {
-                    (api.cuLaunchKernel)(
-                        *fn_gen_u16_pairs,
-                        hash_lines, 1, 1,
-                        128, 1, 1,
-                        0,
-                        self.stream,
-                        args_up.as_mut_ptr(),
-                        std::ptr::null_mut(),
-                    )
-                },
-                "apx_gen_u16_pairs(B)",
-            )?;
+        // Pre-materialize L2-resident `d_panel_b` ONCE PER BLOCK in DirectL2 or Edcp mode!
+        match &self.backend {
+            EngineBackend::DirectL2 {
+                fn_gen_u16_pairs,
+                fn_materialize_128,
+                d_pairs_a,
+                d_pairs_b,
+                d_panel_b,
+                ..
+            } => {
+                let mut p_kb1 = self.d_key_b.ptr;
+                let mut p_kb2 = self.d_key_b.ptr;
+                let mut p_pa = d_pairs_a.ptr;
+                let mut p_pb = d_pairs_b.ptr;
+                let mut k_i32 = self.profile.k as i32;
+                let mut args_up: [*mut c_void; 5] = [
+                    (&mut p_kb1 as *mut CUdeviceptr).cast(),
+                    (&mut p_kb2 as *mut CUdeviceptr).cast(),
+                    (&mut p_pa as *mut CUdeviceptr).cast(),
+                    (&mut p_pb as *mut CUdeviceptr).cast(),
+                    (&mut k_i32 as *mut i32).cast(),
+                ];
+                let hash_lines = ((self.profile.k / 8) as u32 + 127) / 128;
+                check_cu(
+                    api,
+                    unsafe {
+                        (api.cuLaunchKernel)(
+                            *fn_gen_u16_pairs,
+                            hash_lines, 1, 1,
+                            128, 1, 1,
+                            0,
+                            self.stream,
+                            args_up.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    "apx_gen_u16_pairs(B)",
+                )?;
 
-            let mut p_bb = self.bas_b_ptr();
-            let mut p_pb2 = d_pairs_b.ptr;
-            let mut p_out_b = d_panel_b.ptr;
-            let mut start_frag: i32 = 0;
-            let mut k_mat = self.profile.k as i32;
-            let mut args_mb: [*mut c_void; 5] = [
-                (&mut p_bb as *mut CUdeviceptr).cast(),
-                (&mut p_pb2 as *mut CUdeviceptr).cast(),
-                (&mut p_out_b as *mut CUdeviceptr).cast(),
-                (&mut start_frag as *mut i32).cast(),
-                (&mut k_mat as *mut i32).cast(),
-            ];
-            let n_tiles = (self.profile.n / 128) as c_uint;
-            check_cu(
-                api,
-                unsafe {
-                    (api.cuLaunchKernel)(
-                        *fn_materialize_128,
-                        n_tiles, 4, 1,
-                        256, 1, 1,
-                        0,
-                        self.stream,
-                        args_mb.as_mut_ptr(),
-                        std::ptr::null_mut(),
-                    )
-                },
-                "apx_materialize_panel_128(B)",
-            )?;
+                let mut p_bb = self.bas_b_ptr();
+                let mut p_pb2 = d_pairs_b.ptr;
+                let mut p_out_b = d_panel_b.ptr;
+                let mut start_frag: i32 = 0;
+                let mut k_mat = self.profile.k as i32;
+                let mut args_mb: [*mut c_void; 5] = [
+                    (&mut p_bb as *mut CUdeviceptr).cast(),
+                    (&mut p_pb2 as *mut CUdeviceptr).cast(),
+                    (&mut p_out_b as *mut CUdeviceptr).cast(),
+                    (&mut start_frag as *mut i32).cast(),
+                    (&mut k_mat as *mut i32).cast(),
+                ];
+                let n_tiles = (self.profile.n / 128) as c_uint;
+                check_cu(
+                    api,
+                    unsafe {
+                        (api.cuLaunchKernel)(
+                            *fn_materialize_128,
+                            n_tiles, 4, 1,
+                            256, 1, 1,
+                            0,
+                            self.stream,
+                            args_mb.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    "apx_materialize_panel_128(B)",
+                )?;
+            }
+            EngineBackend::Edcp {
+                fn_materialize_b,
+                d_bpairs_120,
+                d_specs_120,
+                d_panel_b,
+                ..
+            } => {
+                let plan = cache.edcp.as_ref().context("missing EDCP plan in Merkle cache")?;
+                let num_chunks = self.profile.k / 128;
+                check_cu(
+                    api,
+                    unsafe {
+                        (api.cuMemcpyHtoDAsync_v2)(
+                            d_bpairs_120.ptr,
+                            plan.bpairs_120.as_ptr() as *const c_void,
+                            num_chunks * 120 * 2,
+                            self.stream,
+                        )
+                    },
+                    "HtoD(edcp_bpairs)",
+                )?;
+                check_cu(
+                    api,
+                    unsafe {
+                        (api.cuMemcpyHtoDAsync_v2)(
+                            d_specs_120.ptr,
+                            plan.specs_120.as_ptr() as *const c_void,
+                            num_chunks * 120 * 4,
+                            self.stream,
+                        )
+                    },
+                    "HtoD(edcp_specs)",
+                )?;
+
+                let mut p_bb = self.bas_b_ptr();
+                let mut p_bp = d_bpairs_120.ptr;
+                let mut p_out_b = d_panel_b.ptr;
+                let mut start_frag: i32 = 0;
+                let mut nchunks_i32 = num_chunks as i32;
+                let mut args_mb: [*mut c_void; 5] = [
+                    (&mut p_bb as *mut CUdeviceptr).cast(),
+                    (&mut p_bp as *mut CUdeviceptr).cast(),
+                    (&mut p_out_b as *mut CUdeviceptr).cast(),
+                    (&mut start_frag as *mut i32).cast(),
+                    (&mut nchunks_i32 as *mut i32).cast(),
+                ];
+                let n_tiles = (self.profile.sampled_n() / 128) as c_uint;
+                check_cu(
+                    api,
+                    unsafe {
+                        (api.cuLaunchKernel)(
+                            *fn_materialize_b,
+                            n_tiles, 4, 1,
+                            256, 1, 1,
+                            0,
+                            self.stream,
+                            args_mb.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    "apx_materialize_edcp_b",
+                )?;
+            }
+            EngineBackend::Basis { fn_gen_b_pairs, d_bpairs, .. } => {
+                let mut p_kb = self.d_key_b.ptr;
+                let mut p_bp = d_bpairs.ptr;
+                let mut k_i32 = self.profile.k as i32;
+                let mut args_bp: [*mut c_void; 3] = [
+                    (&mut p_kb as *mut CUdeviceptr).cast(),
+                    (&mut p_bp as *mut CUdeviceptr).cast(),
+                    (&mut k_i32 as *mut i32).cast(),
+                ];
+                let hash_lines = ((self.profile.k / 8) as u32 + 127) / 128;
+                check_cu(
+                    api,
+                    unsafe {
+                        (api.cuLaunchKernel)(
+                            *fn_gen_b_pairs,
+                            hash_lines, 1, 1,
+                            128, 1, 1,
+                            0,
+                            self.stream,
+                            args_bp.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    "apx_gen_b_pairs",
+                )?;
+            }
         }
 
         check_cu(api, unsafe { (api.cuStreamSynchronize)(self.stream) }, "cuStreamSynchronize(panelB)")?;
-        Ok(cache)
+        Ok(())
+    }
+
+    /// Enqueues one Basis round (`slot` in `{0, 1}`) asynchronously onto `self.stream` using page-locked DMA.
+    fn enqueue_basis_slot(
+        &mut self,
+        slot: usize,
+        key_a: &[u8; 32],
+        epoch: u32,
+        variant_idx: usize,
+        greedy_reorder: bool,
+    ) -> Result<()> {
+        let api = cuda()?;
+        let sampled_m = self.profile.sampled_m() as i32;
+        let p_bas_a_val = self.bas_a_ptr();
+        let p_bas_b_val = self.bas_b_ptr();
+        let v_name = self.variant_name(variant_idx);
+        let abort_dev_ptr = self.ctrl.dev_abort_ptr();
+
+        let EngineBackend::Basis {
+            fn_gen_basis,
+            fn_gen_ab_pairs,
+            fn_reorder_pairs,
+            fn_variants,
+            smem_bytes,
+            d_bpairs,
+            d_pairs,
+            d_pairs_alt,
+            d_key_a_alt,
+            ctrl_alt,
+            ev_alt_round_start,
+            ev_alt_start,
+            ev_alt_end,
+            ..
+        } = &self.backend
+        else {
+            bail!("enqueue_basis_slot requires Basis backend");
+        };
+
+        let (ev_r0, ev_k0, ev_k1, mut p_ka, mut p_pairs, hit_cnt_ptr, hit_grp_ptr, pinned_ka_ptr) = if slot == 0 {
+            (
+                self.ev_round_start,
+                self.ev_start,
+                self.ev_end,
+                self.d_key_a.ptr,
+                d_pairs.ptr,
+                self.ctrl.dev_hit_count_ptr(),
+                self.ctrl.dev_hit_groups_ptr(),
+                self.ctrl.write_pinned_key_a(key_a),
+            )
+        } else {
+            (
+                *ev_alt_round_start,
+                *ev_alt_start,
+                *ev_alt_end,
+                d_key_a_alt.ptr,
+                d_pairs_alt.ptr,
+                ctrl_alt.dev_hit_count_ptr(),
+                ctrl_alt.dev_hit_groups_ptr(),
+                ctrl_alt.write_pinned_key_a(key_a),
+            )
+        };
+
+        check_cu(api, unsafe { (api.cuEventRecord)(ev_r0, self.stream) }, "cuEventRecord(slot_round_start)")?;
+        check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(p_ka, pinned_ka_ptr, 32, self.stream) }, "HtoD(pinned_key_a)")?;
+        check_cu(api, unsafe { (api.cuMemsetD8Async)(hit_cnt_ptr, 0, 4, self.stream) }, "Memset(slot_hit_count)")?;
+
+        let mut p_bas_a = p_bas_a_val;
+        let mut rows_a = sampled_m;
+        let mut is_b_zero: i32 = 0;
+        let mut args_ba: [*mut c_void; 4] = [
+            (&mut p_ka as *mut CUdeviceptr).cast(),
+            (&mut p_bas_a as *mut CUdeviceptr).cast(),
+            (&mut rows_a as *mut i32).cast(),
+            (&mut is_b_zero as *mut i32).cast(),
+        ];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    *fn_gen_basis,
+                    (sampled_m as u32) / 16, 1, 1,
+                    64, 1, 1,
+                    0,
+                    self.stream,
+                    args_ba.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "apx_gen_basis_arch(A)",
+        )?;
+
+        let mut p_bp = d_bpairs.ptr;
+        let mut k_i32 = self.profile.k as i32;
+        let mut args_ab: [*mut c_void; 4] = [
+            (&mut p_ka as *mut CUdeviceptr).cast(),
+            (&mut p_bp as *mut CUdeviceptr).cast(),
+            (&mut p_pairs as *mut CUdeviceptr).cast(),
+            (&mut k_i32 as *mut i32).cast(),
+        ];
+        let hash_lines = ((self.profile.k / 8) as u32 + 127) / 128;
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    *fn_gen_ab_pairs,
+                    hash_lines, 1, 1,
+                    128, 1, 1,
+                    0,
+                    self.stream,
+                    args_ab.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "apx_gen_ab_pairs_from_b",
+        )?;
+
+        let mut enable_g: i32 = if greedy_reorder { 1 } else { 0 };
+        let mut args_ro: [*mut c_void; 3] = [
+            (&mut p_pairs as *mut CUdeviceptr).cast(),
+            (&mut k_i32 as *mut i32).cast(),
+            (&mut enable_g as *mut i32).cast(),
+        ];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    *fn_reorder_pairs,
+                    ((self.profile.k / 128) as u32 + 3) / 4, 1, 1,
+                    128, 1, 1,
+                    0,
+                    self.stream,
+                    args_ro.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "apx_reorder_pairs_arch",
+        )?;
+
+        check_cu(api, unsafe { (api.cuEventRecord)(ev_k0, self.stream) }, "cuEventRecord(slot_start)")?;
+
+        let mut kparams = ApxBasisParams {
+            bas_a: p_bas_a_val,
+            bas_b: p_bas_b_val,
+            pairs: p_pairs,
+            sampled_m,
+            n: self.profile.n as i32,
+            k: self.profile.k as i32,
+            key_a: p_ka,
+            target_le: self.d_target_le.ptr,
+            hit_count: hit_cnt_ptr,
+            hit_groups: hit_grp_ptr,
+            hit_cap: self.hit_cap as i32,
+            abort_epoch_ptr: abort_dev_ptr,
+            expected_epoch: epoch,
+        };
+        let mut launch_args: [*mut c_void; 1] = [(&mut kparams as *mut ApxBasisParams).cast()];
+        check_cu(
+            api,
+            unsafe {
+                (api.cuLaunchKernel)(
+                    fn_variants[variant_idx % 4],
+                    self.info.sm_count as c_uint, 1, 1,
+                    256, 1, 1,
+                    *smem_bytes as c_uint,
+                    self.stream,
+                    launch_args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            v_name,
+        )?;
+
+        check_cu(api, unsafe { (api.cuEventRecord)(ev_k1, self.stream) }, "cuEventRecord(slot_end)")?;
+        Ok(())
+    }
+
+    /// Zero-bubble 2-slot ping-pong mining pipeline:
+    /// Enqueues round `r + 1` onto `self.stream` BEFORE sleeping on round `r`, eliminating 100% of host
+    /// wakeup latency and keeping GPU memory & SM P-states continuously locked at peak efficiency!
+    pub fn mine_round_pipelined(
+        &mut self,
+        job: &PreparedJob,
+        cache: &Constant64MerkleCache,
+        next_nonce: &mut dyn FnMut() -> u64,
+        epoch: u32,
+        variant_idx: usize,
+    ) -> Result<(u64, RoundOutcome)> {
+        if !matches!(self.backend, EngineBackend::Basis { .. }) {
+            let n = next_nonce();
+            let out = self.mine_round(job, cache, n, epoch, variant_idx, true)?;
+            return Ok((n, out));
+        }
+
+        self.bind_context()?;
+        let api = cuda()?;
+
+        let cur_inflight = match &self.backend {
+            EngineBackend::Basis { inflight, .. } => *inflight,
+            _ => None,
+        };
+
+        let cur = match cur_inflight {
+            Some(inf) if inf.epoch == epoch => inf,
+            Some(_) => {
+                self.flush_pipeline()?;
+                if self.ctrl.epoch_atomic().load(Ordering::Acquire) != epoch {
+                    return Ok((
+                        0,
+                        RoundOutcome {
+                            round_ms: 0.0,
+                            kernel_ms: 0.0,
+                            total_hits: 0,
+                            hit_groups: Vec::new(),
+                            aborted: true,
+                        },
+                    ));
+                }
+                let n0 = next_nonce();
+                let (_sig, _ra, ka0) = cache.derive_attempt(job, n0);
+                self.enqueue_basis_slot(0, &ka0, epoch, variant_idx, true)?;
+                InflightBasisRound { slot: 0, nonce: n0, epoch }
+            }
+            None => {
+                if self.ctrl.epoch_atomic().load(Ordering::Acquire) != epoch {
+                    return Ok((
+                        0,
+                        RoundOutcome {
+                            round_ms: 0.0,
+                            kernel_ms: 0.0,
+                            total_hits: 0,
+                            hit_groups: Vec::new(),
+                            aborted: true,
+                        },
+                    ));
+                }
+                let n0 = next_nonce();
+                let (_sig, _ra, ka0) = cache.derive_attempt(job, n0);
+                self.enqueue_basis_slot(0, &ka0, epoch, variant_idx, true)?;
+                InflightBasisRound { slot: 0, nonce: n0, epoch }
+            }
+        };
+
+        // Pre-enqueue next round (`cur.slot ^ 1`) BEFORE waiting on `cur.slot`!
+        let next_inf = if self.ctrl.epoch_atomic().load(Ordering::Acquire) == epoch {
+            let n1 = next_nonce();
+            let (_sig, _ra, ka1) = cache.derive_attempt(job, n1);
+            self.enqueue_basis_slot(cur.slot ^ 1, &ka1, epoch, variant_idx, true)?;
+            Some(InflightBasisRound {
+                slot: cur.slot ^ 1,
+                nonce: n1,
+                epoch,
+            })
+        } else {
+            None
+        };
+
+        if let EngineBackend::Basis { inflight, .. } = &mut self.backend {
+            *inflight = next_inf;
+        }
+
+        let (ev_r0, ev_k0, ev_k1) = match &self.backend {
+            EngineBackend::Basis {
+                ev_alt_round_start,
+                ev_alt_start,
+                ev_alt_end,
+                ..
+            } => {
+                if cur.slot == 0 {
+                    (self.ev_round_start, self.ev_start, self.ev_end)
+                } else {
+                    (*ev_alt_round_start, *ev_alt_start, *ev_alt_end)
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        check_cu(api, unsafe { (api.cuEventSynchronize)(ev_k1) }, "cuEventSynchronize(slot)")?;
+
+        let mut round_ms = 0.0f32;
+        let mut kernel_ms = 0.0f32;
+        check_cu(api, unsafe { (api.cuEventElapsedTime)(&mut round_ms, ev_r0, ev_k1) }, "cuEventElapsedTime(slot_round)")?;
+        check_cu(api, unsafe { (api.cuEventElapsedTime)(&mut kernel_ms, ev_k0, ev_k1) }, "cuEventElapsedTime(slot_kernel)")?;
+
+        let aborted = self.ctrl.epoch_atomic().load(Ordering::Acquire) != epoch;
+        let (total_hits, mut hit_groups) = match &self.backend {
+            EngineBackend::Basis { ctrl_alt, .. } => {
+                if cur.slot == 0 {
+                    self.ctrl.read_hits(self.hit_cap)
+                } else {
+                    ctrl_alt.read_hits(self.hit_cap)
+                }
+            }
+            _ => unreachable!(),
+        };
+        hit_groups.sort_unstable();
+
+        Ok((
+            cur.nonce,
+            RoundOutcome {
+                round_ms: round_ms.max(kernel_ms),
+                kernel_ms,
+                total_hits,
+                hit_groups,
+                aborted,
+            },
+        ))
     }
 
     /// Executes one full mining round for `nonce` on `variant_idx`.
@@ -945,12 +1576,13 @@ impl GpuWorkerEngine {
         variant_idx: usize,
         greedy_reorder: bool,
     ) -> Result<RoundOutcome> {
-        self.bind_context()?;
+        self.flush_pipeline()?;
         let api = cuda()?;
         let (_sig, _root_a, key_a) = cache.derive_attempt(job, nonce);
+        let pinned_ka = self.ctrl.write_pinned_key_a(&key_a);
 
         check_cu(api, unsafe { (api.cuEventRecord)(self.ev_round_start, self.stream) }, "cuEventRecord(round_start)")?;
-        check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_key_a.ptr, key_a.as_ptr() as *const c_void, 32, self.stream) }, "HtoD(key_a)")?;
+        check_cu(api, unsafe { (api.cuMemcpyHtoDAsync_v2)(self.d_key_a.ptr, pinned_ka, 32, self.stream) }, "HtoD(key_a)")?;
         check_cu(api, unsafe { (api.cuMemsetD8Async)(self.ctrl.dev_hit_count_ptr(), 0, 4, self.stream) }, "Memset(hit_count)")?;
 
         match &self.backend {
@@ -1136,12 +1768,183 @@ impl GpuWorkerEngine {
                     aborted,
                 })
             }
+            EngineBackend::Edcp {
+                fn_gen_basis,
+                fn_prepare_a,
+                fn_materialize_a,
+                fn_variants,
+                d_specs_120,
+                d_apairs2_120,
+                d_panel_a,
+                d_panel_b,
+                panel_m_tiles,
+                ..
+            } => {
+                let sampled_m = self.profile.sampled_m() as i32;
+                let num_chunks = self.profile.k / 128;
+                let mut p_ka = self.d_key_a.ptr;
+                let mut p_bas_a = self.bas_a_ptr();
+                let mut rows_a = sampled_m;
+                let mut is_b_zero: i32 = 0;
+                let mut args_ba: [*mut c_void; 4] = [
+                    (&mut p_ka as *mut CUdeviceptr).cast(),
+                    (&mut p_bas_a as *mut CUdeviceptr).cast(),
+                    (&mut rows_a as *mut i32).cast(),
+                    (&mut is_b_zero as *mut i32).cast(),
+                ];
+                check_cu(
+                    api,
+                    unsafe {
+                        (api.cuLaunchKernel)(
+                            *fn_gen_basis,
+                            (sampled_m as u32) / 16, 1, 1,
+                            64, 1, 1,
+                            0,
+                            self.stream,
+                            args_ba.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    "apx_gen_basis_linear(A,edcp)",
+                )?;
+
+                let mut p_specs = d_specs_120.ptr;
+                let mut p_ap2 = d_apairs2_120.ptr;
+                let mut nchunks_i32 = num_chunks as i32;
+                let mut args_pa: [*mut c_void; 4] = [
+                    (&mut p_ka as *mut CUdeviceptr).cast(),
+                    (&mut p_specs as *mut CUdeviceptr).cast(),
+                    (&mut p_ap2 as *mut CUdeviceptr).cast(),
+                    (&mut nchunks_i32 as *mut i32).cast(),
+                ];
+                check_cu(
+                    api,
+                    unsafe {
+                        (api.cuLaunchKernel)(
+                            *fn_prepare_a,
+                            num_chunks as c_uint, 1, 1,
+                            128, 1, 1,
+                            0,
+                            self.stream,
+                            args_pa.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    "apx_prepare_edcp_a",
+                )?;
+
+                check_cu(api, unsafe { (api.cuEventRecord)(self.ev_start, self.stream) }, "cuEventRecord(start)")?;
+
+                let total_m_tiles = self.profile.sampled_m() / 128;
+                let n_tiles = self.profile.sampled_n() / 128;
+                let v_idx = variant_idx % 2;
+                let chosen_fn = fn_variants[v_idx];
+                let key_a_u32 = bytes32_to_u32x8(&key_a);
+                let target_u32 = bytes32_to_u32x8(&job.bound_le);
+
+                let mut base_bm = 0usize;
+                let mut aborted = false;
+                while base_bm < total_m_tiles {
+                    if self.ctrl.epoch_atomic().load(Ordering::Acquire) != epoch {
+                        aborted = true;
+                        break;
+                    }
+                    let cur_m = (*panel_m_tiles).min(total_m_tiles - base_bm);
+
+                    let mut p_ba = self.bas_a_ptr();
+                    let mut p_ap2_m = d_apairs2_120.ptr;
+                    let mut p_out_a = d_panel_a.ptr;
+                    let mut start_frag = (base_bm * 8) as i32;
+                    let mut nchunks_m = num_chunks as i32;
+                    let mut args_ma: [*mut c_void; 5] = [
+                        (&mut p_ba as *mut CUdeviceptr).cast(),
+                        (&mut p_ap2_m as *mut CUdeviceptr).cast(),
+                        (&mut p_out_a as *mut CUdeviceptr).cast(),
+                        (&mut start_frag as *mut i32).cast(),
+                        (&mut nchunks_m as *mut i32).cast(),
+                    ];
+                    let mat_c_parts = optimal_mat_k_parts(
+                        cur_m,
+                        self.info.sm_count.max(1) as usize,
+                        num_chunks,
+                    );
+                    check_cu(
+                        api,
+                        unsafe {
+                            (api.cuLaunchKernel)(
+                                *fn_materialize_a,
+                                cur_m as c_uint, mat_c_parts, 1,
+                                256, 1, 1,
+                                0,
+                                self.stream,
+                                args_ma.as_mut_ptr(),
+                                std::ptr::null_mut(),
+                            )
+                        },
+                        "apx_materialize_edcp_a",
+                    )?;
+
+                    let mut ep = ApxDirectL2Params {
+                        panel_a: d_panel_a.ptr,
+                        panel_b: d_panel_b.ptr,
+                        m_tiles: cur_m as i32,
+                        n_tiles: n_tiles as i32,
+                        num_ks: num_chunks as i32,
+                        base_bm: base_bm as i32,
+                        total_n_warps: (self.profile.n / 64) as i32,
+                        hit_cap: self.hit_cap as i32,
+                        hit_count: self.ctrl.dev_hit_count_ptr(),
+                        hit_groups: self.ctrl.dev_hit_groups_ptr(),
+                        key_a: key_a_u32,
+                        target_le: target_u32,
+                    };
+                    let mut launch_args: [*mut c_void; 1] = [(&mut ep as *mut ApxDirectL2Params).cast()];
+                    check_cu(
+                        api,
+                        unsafe {
+                            (api.cuLaunchKernel)(
+                                chosen_fn,
+                                (cur_m * n_tiles) as c_uint, 1, 1,
+                                128, 1, 1,
+                                SMEM_EDCP_2CTA_BYTES as c_uint,
+                                self.stream,
+                                launch_args.as_mut_ptr(),
+                                std::ptr::null_mut(),
+                            )
+                        },
+                        self.variant_name(v_idx),
+                    )?;
+
+                    base_bm += cur_m;
+                }
+
+                check_cu(api, unsafe { (api.cuEventRecord)(self.ev_end, self.stream) }, "cuEventRecord(end)")?;
+                check_cu(api, unsafe { (api.cuEventSynchronize)(self.ev_end) }, "cuEventSynchronize")?;
+
+                let mut round_ms = 0.0f32;
+                let mut kernel_ms = 0.0f32;
+                check_cu(api, unsafe { (api.cuEventElapsedTime)(&mut round_ms, self.ev_round_start, self.ev_end) }, "cuEventElapsedTime(round)")?;
+                check_cu(api, unsafe { (api.cuEventElapsedTime)(&mut kernel_ms, self.ev_start, self.ev_end) }, "cuEventElapsedTime(kernel)")?;
+
+                aborted |= self.ctrl.epoch_atomic().load(Ordering::Acquire) != epoch;
+                let (total_hits, mut hit_groups) = self.ctrl.read_hits(self.hit_cap);
+                hit_groups.sort_unstable();
+
+                Ok(RoundOutcome {
+                    round_ms: round_ms.max(kernel_ms),
+                    kernel_ms,
+                    total_hits,
+                    hit_groups,
+                    aborted,
+                })
+            }
             EngineBackend::Basis {
                 fn_gen_basis,
-                fn_gen_raw_pairs,
+                fn_gen_ab_pairs,
                 fn_reorder_pairs,
                 fn_variants,
                 smem_bytes,
+                d_bpairs,
                 d_pairs,
                 ..
             } => {
@@ -1172,12 +1975,12 @@ impl GpuWorkerEngine {
                     "apx_gen_basis_arch(A)",
                 )?;
 
-                let mut p_kb = self.d_key_b.ptr;
+                let mut p_bp = d_bpairs.ptr;
                 let mut p_pairs = d_pairs.ptr;
                 let mut k_i32 = self.profile.k as i32;
                 let mut args_rp: [*mut c_void; 4] = [
                     (&mut p_ka as *mut CUdeviceptr).cast(),
-                    (&mut p_kb as *mut CUdeviceptr).cast(),
+                    (&mut p_bp as *mut CUdeviceptr).cast(),
                     (&mut p_pairs as *mut CUdeviceptr).cast(),
                     (&mut k_i32 as *mut i32).cast(),
                 ];
@@ -1186,7 +1989,7 @@ impl GpuWorkerEngine {
                     api,
                     unsafe {
                         (api.cuLaunchKernel)(
-                            *fn_gen_raw_pairs,
+                            *fn_gen_ab_pairs,
                             hash_lines, 1, 1,
                             128, 1, 1,
                             0,
@@ -1195,7 +1998,7 @@ impl GpuWorkerEngine {
                             std::ptr::null_mut(),
                         )
                     },
-                    "apx_gen_raw_pairs",
+                    "apx_gen_ab_pairs_from_b",
                 )?;
 
                 let mut enable_g: i32 = if greedy_reorder { 1 } else { 0 };
@@ -1277,8 +2080,8 @@ impl GpuWorkerEngine {
         }
     }
 
-    /// Runs an interleaved benchmark across all variants of the active engine, verifies identical
-    /// hit counts across every variant, and activates the fastest one!
+    /// Runs a clock-drift-compensated ABBA benchmark across all variants of the active engine,
+    /// verifies identical hit counts across every variant, and activates the fastest one!
     pub fn run_autotune(&mut self, job: &PreparedJob, cache: &Constant64MerkleCache, epoch: u32, passes: usize) -> Result<(usize, Vec<(String, f64)>)> {
         let nv = self.num_variants();
         let test_nonce = 0x1337_c0de_2026_0001u64;
@@ -1304,9 +2107,11 @@ impl GpuWorkerEngine {
 
         let mut sum_ms = vec![0.0f64; nv];
         let mut nonce = test_nonce + 1;
-        let reps = passes.max(3);
-        for _ in 0..reps {
-            for v in 0..nv {
+        // Symmetric even number of ABBA passes cancels thermal/PL2 boost clock slope!
+        let reps = (passes.max(4) + 1) & !1;
+        for p_idx in 0..reps {
+            for step_v in 0..nv {
+                let v = if p_idx % 2 == 0 { step_v } else { nv - 1 - step_v };
                 let r = self.mine_round(job, cache, nonce, epoch, v, true)?;
                 nonce += 1;
                 if r.aborted {
@@ -1340,6 +2145,17 @@ impl Drop for GpuWorkerEngine {
             unsafe {
                 let _ = (api.cuCtxSetCurrent)(self.ctx);
                 let _ = (api.cuStreamSynchronize)(self.stream);
+                if let EngineBackend::Basis {
+                    ev_alt_round_start,
+                    ev_alt_start,
+                    ev_alt_end,
+                    ..
+                } = &self.backend
+                {
+                    let _ = (api.cuEventDestroy_v2)(*ev_alt_round_start);
+                    let _ = (api.cuEventDestroy_v2)(*ev_alt_start);
+                    let _ = (api.cuEventDestroy_v2)(*ev_alt_end);
+                }
                 let _ = (api.cuEventDestroy_v2)(self.ev_round_start);
                 let _ = (api.cuEventDestroy_v2)(self.ev_start);
                 let _ = (api.cuEventDestroy_v2)(self.ev_end);

@@ -73,7 +73,7 @@ fn main() {
         &out_dir.join("apexprl_direct_sm120a.cubin"),
     );
 
-    // Classic On-Chip Basis 160x256 cubins (`--engine basis`)
+    // Classic On-Chip Basis 160x256 cubins (`--engine basis160`)
     compile_cubin(
         &nvcc,
         &kernels_dir.join("apexprl_sm89.cu"),
@@ -87,5 +87,21 @@ fn main() {
         "sm_120a",
         "-O1",
         &out_dir.join("apexprl_sm120a.cubin"),
+    );
+
+    // Zero-Outlier Graph-Theoretic EDCP-120 2-CTA/SM cubins (`--engine edcp`)
+    compile_cubin(
+        &nvcc,
+        &kernels_dir.join("apexprl_edcp_sm89.cu"),
+        "sm_89",
+        "-O3",
+        &out_dir.join("apexprl_edcp_sm89.cubin"),
+    );
+    compile_cubin(
+        &nvcc,
+        &kernels_dir.join("apexprl_edcp_sm120a.cu"),
+        "sm_120a",
+        "-O1",
+        &out_dir.join("apexprl_edcp_sm120a.cubin"),
     );
 }

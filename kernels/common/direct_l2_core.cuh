@@ -104,6 +104,7 @@ extern "C" __global__ __launch_bounds__(256) void apx_materialize_panel_128(
   __syncthreads();
 
   const int sub_grp = lane & 3;
+  const unsigned prmt_sel = 0x4400u + unsigned(sub_grp) * 0x1111u;
   const int k_word = lane >> 2;
   const int out_r = lane >> 1;
   const int out_c = lane & 1;
@@ -129,14 +130,8 @@ extern "C" __global__ __launch_bounds__(256) void apx_materialize_panel_128(
         uint32_t x1 = __shfl_sync(0xffffffffu, d[g], (k_word << 2) | 1);
         uint32_t x2 = __shfl_sync(0xffffffffu, d[g], (k_word << 2) | 2);
         uint32_t x3 = __shfl_sync(0xffffffffu, d[g], (k_word << 2) | 3);
-        uint32_t t01 = (sub_grp == 0) ? __byte_perm(x0, x1, 0x4400)
-                     : (sub_grp == 1) ? __byte_perm(x0, x1, 0x5511)
-                     : (sub_grp == 2) ? __byte_perm(x0, x1, 0x6622)
-                                      : __byte_perm(x0, x1, 0x7733);
-        uint32_t t23 = (sub_grp == 0) ? __byte_perm(x2, x3, 0x4400)
-                     : (sub_grp == 1) ? __byte_perm(x2, x3, 0x5511)
-                     : (sub_grp == 2) ? __byte_perm(x2, x3, 0x6622)
-                                      : __byte_perm(x2, x3, 0x7733);
+        uint32_t t01 = __byte_perm(x0, x1, prmt_sel);
+        uint32_t t23 = __byte_perm(x2, x3, prmt_sel);
         s_tr[warp][g * 4 + sub_grp][k_word] = __byte_perm(t01, t23, 0x6420);
       }
       __syncwarp();

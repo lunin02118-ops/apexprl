@@ -5,10 +5,12 @@ mod api_server;
 
 use anyhow::{ensure, Context, Result};
 use api_server::{spawn_api_server, PerGpuStats, RigTelemetry, TelemetrySensors};
-use apexprl_gpu::{enumerate_gpus, optimal_direct_l2_n, EngineKind, GpuDeviceInfo, GpuWorkerEngine, TuneCacheFile};
+use apexprl_gpu::{
+    enumerate_gpus, optimal_direct_l2_n, optimal_edcp_n, EngineKind, GpuDeviceInfo, GpuWorkerEngine, TuneCacheFile,
+};
 use apexprl_pow::{
-    cpu_eval_group_digest, optimal_kryptex_diff, verify_and_encode_proof, Constant64MerkleCache,
-    KernelProfile, PoolNotifyJob, PreparedJob,
+    cpu_eval_group_digest, optimal_kryptex_diff, verify_and_encode_proof, verify_and_encode_share_fast,
+    Constant64MerkleCache, KernelProfile, PoolNotifyJob, PreparedJob,
 };
 use apexprl_stratum::{StratumEvent, StratumSession};
 use clap::Parser;
@@ -57,11 +59,11 @@ struct Cli {
     #[arg(long, visible_alias = "password", default_value = "auto")]
     pass: String,
 
-    /// Compute engine (`basis128` = v0.3 Uniform-3 L2-Pinned 128x256 [default], `basis160` = v0.1, `direct` = v0.2)
+    /// Compute engine (`basis128` = v0.4 Wavefront-Exact 2-Opt 128x256 [default], `direct` = v0.4 Zero-Eviction L2 2-CTA/SM, `edcp` = v0.4 Zero-Outlier Cycle-Packing K<=120, `basis160` = v0.1)
     #[arg(long, default_value = "basis128")]
     engine: String,
 
-    /// Inner matrix dimension K (defaults: `16384` for `basis128`/`basis160`, `4096` for `direct`)
+    /// Inner matrix dimension K (defaults: `65536` for `basis128` on gzip-v2, `16384` for `basis160`, `2048` for `direct`/`edcp`)
     #[arg(long)]
     k: Option<usize>,
 
@@ -165,21 +167,23 @@ fn parse_engine(raw: &str) -> Result<EngineKind> {
         "basis128" | "b128" | "uniform3" | "u3" => Ok(EngineKind::Basis128),
         "basis160" | "basis" | "legacy" => Ok(EngineKind::Basis160),
         "direct" | "hyper-l2" | "hl2" | "l2" => Ok(EngineKind::DirectL2),
-        other => anyhow::bail!("Unsupported --engine '{other}'; expected 'basis128', 'basis160', or 'direct'"),
+        "edcp" | "edcp120" | "k120" | "cycle" | "forest" => Ok(EngineKind::Edcp120),
+        other => anyhow::bail!("Unsupported --engine '{other}'; expected 'basis128', 'direct', 'edcp', or 'basis160'"),
     }
 }
 
 fn build_profile(gpus: &[GpuDeviceInfo], engine: EngineKind, k_opt: Option<usize>, gzip_v2: bool) -> Result<KernelProfile> {
     match engine {
         EngineKind::Basis128 => {
-            let raw_k = k_opt.unwrap_or(16384);
+            let raw_k = k_opt.unwrap_or(65536);
             let active_k = if !gzip_v2 && raw_k > 4096 {
                 println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096 to fit plain proof limit");
                 4096
             } else {
                 raw_k
             };
-            KernelProfile::basis_128x256(active_k)
+            let sm_counts: Vec<usize> = gpus.iter().map(|g| g.sm_count.max(1) as usize).collect();
+            KernelProfile::basis_128x256_sm_aligned(&sm_counts, active_k)
         }
         EngineKind::Basis160 => {
             let raw_k = k_opt.unwrap_or(16384);
@@ -192,7 +196,7 @@ fn build_profile(gpus: &[GpuDeviceInfo], engine: EngineKind, k_opt: Option<usize
             KernelProfile::basis_160x256(active_k)
         }
         EngineKind::DirectL2 => {
-            let raw_k = k_opt.unwrap_or(4096);
+            let raw_k = k_opt.unwrap_or(2048);
             let active_k = if !gzip_v2 && raw_k > 4096 {
                 println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096");
                 4096
@@ -207,6 +211,23 @@ fn build_profile(gpus: &[GpuDeviceInfo], engine: EngineKind, k_opt: Option<usize
                 .unwrap_or(32 * 1024 * 1024);
             let n = optimal_direct_l2_n(min_l2, active_k);
             KernelProfile::direct_l2_128x128(32768, n, active_k)
+        }
+        EngineKind::Edcp120 => {
+            let raw_k = k_opt.unwrap_or(2048);
+            let active_k = if !gzip_v2 && raw_k > 4096 {
+                println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096");
+                4096
+            } else {
+                raw_k
+            };
+            let min_l2 = gpus
+                .iter()
+                .map(|g| g.l2_bytes)
+                .filter(|&b| b > 0)
+                .min()
+                .unwrap_or(32 * 1024 * 1024);
+            let n = optimal_edcp_n(min_l2, active_k);
+            KernelProfile::edcp_120(32768, n, active_k)
         }
     }
 }
@@ -298,20 +319,23 @@ fn verify_selftest_profile(gpus: &[GpuDeviceInfo], cli: &Cli, label: &str, profi
     Ok(())
 }
 
-/// Runs rigorous Gate G0 hardware verification across BOTH `DirectL2` (v0.2) and `Basis160` (v0.1):
-/// 1. Builds Merkle heap on GPU (including rectangular `M > N` subtree) and checks root vs CPU.
-/// 2. Runs every kernel variant (`hl2-2cta`, `hl2-2cta-s2/df`, `hl2-3stg` & `v0..v3`) for 100% hit parity.
+/// Runs rigorous Gate G0 quad-engine hardware verification across `Basis128`, `Edcp120`, `DirectL2`, and `Basis160`:
+/// 1. Builds Merkle heap on GPU (including rectangular `M > N` subtree & `EDCP` `b_salt` plan) and checks root vs CPU.
+/// 2. Runs every kernel variant (`ada128/bw128`, `edcp-2cta`, `hl2-2cta`, `v0..v3`) for 100% hit-set parity.
 /// 3. Cross-checks GPU hit digests against exact CPU `cpu_eval_group_digest`.
-/// 4. Verifies full `PlainProof` via official `zk-pow::verify_plain_proof` + `gzip`!
+/// 4. Verifies full `PlainProof` via official `zk-pow::verify_plain_proof` V3 + `gzip`!
 fn run_hardware_selftest(gpus: &[GpuDeviceInfo], cli: &Cli) -> Result<()> {
-    println!("[selftest] Starting triple-engine hardware + zk-pow verification across {} GPU(s)...", gpus.len());
-    // 1. v0.3 Uniform-3 Basis-128x256 (default engine! K=4096 exercises stp>=16 rotl_xor<13> fold too!)
+    println!("[selftest] Starting quad-engine hardware + zk-pow V3 verification across {} GPU(s)...", gpus.len());
+    // 1. v0.5 Persistent-A Unpredicated Basis-128x256 (power-of-two AND SM-aligned odd-leaf M < N! K=4096 exercises rotl_xor<13>)
     verify_selftest_profile(gpus, cli, "basis-128", KernelProfile::with_dims_128x256(1024, 1024, 4096)?)?;
-    // 2. v0.1 Legacy Basis-160x256
-    verify_selftest_profile(gpus, cli, "basis-160", KernelProfile::with_dims(1024, 1024, 2048)?)?;
-    // 3. v0.2 Hyper-L2 Direct rectangular M > N
+    verify_selftest_profile(gpus, cli, "basis-128-sm", KernelProfile::with_dims_128x256(400, 512, 4096)?)?;
+    // 2. v0.4 Zero-Outlier EDCP-120 Cycle-Packing (Constant-0 + b_salt, K=2048)
+    verify_selftest_profile(gpus, cli, "edcp-120", KernelProfile::edcp_120(1024, 512, 2048)?)?;
+    // 3. v0.4 Zero-Eviction Hyper-L2 Direct rectangular M > N
     verify_selftest_profile(gpus, cli, "direct-l2", KernelProfile::direct_l2_128x128(1024, 512, 2048)?)?;
-    println!("[selftest] ALL CHECKS PASSED (BIT-EXACT GPU == CPU == ZK-POW V3 FOR ALL 3 ENGINES)!");
+    // 4. v0.1 Legacy Basis-160x256
+    verify_selftest_profile(gpus, cli, "basis-160", KernelProfile::with_dims(1024, 1024, 2048)?)?;
+    println!("[selftest] ALL CHECKS PASSED (BIT-EXACT GPU == CPU == ZK-POW V3 FOR ALL 4 ENGINES)!");
     Ok(())
 }
 
@@ -380,12 +404,25 @@ fn run_offline_benchmark(gpus: &[GpuDeviceInfo], cli: &Cli, seconds: u64) -> Res
             println!("[tune] GPU #{} selected '{}' ({})", info.ordinal, eng.variant_name(win), summary.join(", "));
         }
 
-        // Short warm-up so boost clocks & L2 stabilize before timed window
-        for w in 0..3u64 {
-            let _ = eng.mine_round(&job, &cache, 500 + w, 1, eng.active_variant, true)?;
+        // Short warm-up via zero-bubble async ping-pong pipeline so boost clocks & L2 stabilize
+        let mut bench_nonce = 500u64;
+        let active_var = eng.active_variant;
+        for _ in 0..4 {
+            let _ = eng.mine_round_pipelined(
+                &job,
+                &cache,
+                &mut || {
+                    let n = bench_nonce;
+                    bench_nonce += 1;
+                    n
+                },
+                1,
+                active_var,
+            )?;
         }
 
         let t0 = Instant::now();
+        let mut last_sens_at = Instant::now() - Duration::from_secs(10);
         let mut rounds = 0u64;
         let mut round_sec = 0.0f64;
         let mut kernel_sec = 0.0f64;
@@ -394,12 +431,23 @@ fn run_offline_benchmark(gpus: &[GpuDeviceInfo], cli: &Cli, seconds: u64) -> Res
         let mut sens_n = 0u64;
         let mut last_sens = eng.sensors();
         while t0.elapsed() < Duration::from_secs(seconds.max(3)) && !STOP_SIGNAL.load(Ordering::Relaxed) {
-            let out = eng.mine_round(&job, &cache, 1000 + rounds, 1, eng.active_variant, true)?;
+            let (_used_nonce, out) = eng.mine_round_pipelined(
+                &job,
+                &cache,
+                &mut || {
+                    let n = bench_nonce;
+                    bench_nonce += 1;
+                    n
+                },
+                1,
+                active_var,
+            )?;
             rounds += 1;
             round_sec += (out.round_ms as f64) * 1e-3;
             kernel_sec += (out.kernel_ms as f64) * 1e-3;
             let cur_ths_macs = ((rounds as f64) * profile.macs_per_round()) / round_sec.max(1e-6);
-            if rounds % 4 == 1 || t0.elapsed() >= Duration::from_secs(seconds.max(3)) {
+            if last_sens_at.elapsed() >= Duration::from_secs(4) || t0.elapsed() >= Duration::from_secs(seconds.max(3)) {
+                last_sens_at = Instant::now();
                 let cur_sens = eng.sensors();
                 last_sens = cur_sens;
                 if cur_sens.sm_clock_mhz > 0 {
@@ -414,6 +462,7 @@ fn run_offline_benchmark(gpus: &[GpuDeviceInfo], cli: &Cli, seconds: u64) -> Res
                 }
             }
         }
+        let _ = eng.flush_pipeline();
         let avg_sm_mhz = if sens_n > 0 { sum_sm_mhz / (sens_n as f64) } else { last_sens.sm_clock_mhz as f64 };
         let avg_power_w = if sens_n > 0 { sum_power_w / (sens_n as f64) } else { last_sens.power_w as f64 };
         let total_macs = (rounds as f64) * profile.macs_per_round();
@@ -563,6 +612,7 @@ fn main() -> Result<()> {
         EngineKind::Basis128 => "b128",
         EngineKind::Basis160 => "b160",
         EngineKind::DirectL2 => "direct",
+        EngineKind::Edcp120 => "edcp",
     };
 
     let global_epoch = Arc::new(AtomicU32::new(1));
@@ -583,6 +633,7 @@ fn main() -> Result<()> {
 
     let first_notify = session.current_job.clone().expect("initial job present");
     let first_prep = PreparedJob::new(first_notify, profile)?;
+    let pending_job: Arc<RwLock<(u32, PreparedJob)>> = Arc::new(RwLock::new((1, first_prep.clone())));
     let mut first_cache: Option<Constant64MerkleCache> = None;
 
     for (slot_i, info) in gpus.iter().enumerate() {
@@ -594,16 +645,21 @@ fn main() -> Result<()> {
             cli.cclock_lock,
             cli.pl,
         )?;
-        let cache = eng.prepare_job(&first_prep, 1)?;
+        if slot_i == 0 {
+            first_cache = Some(eng.prepare_job(&first_prep, 1)?);
+        } else {
+            eng.load_job_with_cache(&first_prep, first_cache.as_ref().unwrap(), 1)?;
+        }
+        let cache_ref = first_cache.as_ref().unwrap();
         let tune_key = format!(
-            "v03_{}_{}_sm{}{}_n{}_k{}",
+            "v05_{}_{}_sm{}{}_n{}_k{}",
             engine_tag, info.name, info.sm_major, info.sm_minor, profile.n, active_k
         );
         if let Some(&cached_v) = tune_db.entries.get(&tune_key) {
             eng.active_variant = cached_v % eng.num_variants();
         } else if cli.tune {
             println!("[tune] Calibrating GPU #{} ({}) [{}]...", info.ordinal, info.name, engine_tag);
-            if let Ok((win, scores)) = eng.run_autotune(&first_prep, &cache, 1, 3) {
+            if let Ok((win, scores)) = eng.run_autotune(&first_prep, cache_ref, 1, 4) {
                 let s: Vec<String> = scores.iter().map(|(n, r)| format!("{n}:{r:.1}")).collect();
                 println!("[tune] GPU #{} winner: {} ({})", info.ordinal, eng.variant_name(win), s.join(" "));
                 tune_db.entries.insert(tune_key, win);
@@ -622,9 +678,6 @@ fn main() -> Result<()> {
             notes.join(", ")
         );
         abort_ptrs_usize.push(eng.abort_epoch_ptr_usize());
-        if slot_i == 0 {
-            first_cache = Some(cache);
-        }
         engines.push((slot_i, eng));
     }
 
@@ -644,12 +697,13 @@ fn main() -> Result<()> {
     let (hit_tx, hit_rx): (Sender<RawHitCandidate>, Receiver<RawHitCandidate>) = bounded(512);
     let (share_tx, share_rx): (Sender<VerifiedShare>, Receiver<VerifiedShare>) = bounded(256);
 
-    // Background Proof Builder & Official `zk-pow` Verifier Thread
+    // Background Proof Builder & Low-Power Canary + Exact Jackpot Verifier Thread
     {
         let shared_job_pf = shared_job.clone();
         let telemetry_pf = telemetry.clone();
         let gzip_pf = use_gzip_flag.clone();
         thread::spawn(move || {
+            let mut last_canary_epoch = 0u32;
             while let Ok(cand) = hit_rx.recv() {
                 let active_opt = shared_job_pf.read().unwrap().clone();
                 let Some(active) = active_opt else { continue };
@@ -657,10 +711,19 @@ fn main() -> Result<()> {
                     telemetry_pf.write().unwrap().stale_shares += 1;
                     continue;
                 }
-                match active.cache.build_plain_proof(cand.group, cand.nonce)
-                    .and_then(|prf| verify_and_encode_proof(&active.job, &prf, gzip_pf.load(Ordering::Relaxed)).map(|v| (prf, v)))
-                {
-                    Ok((_prf, (wire_b64, raw_len, wire_len))) => {
+                let full_canary = active.epoch != last_canary_epoch;
+                match verify_and_encode_share_fast(
+                    &active.job,
+                    &active.cache,
+                    cand.nonce,
+                    cand.group,
+                    gzip_pf.load(Ordering::Relaxed),
+                    full_canary,
+                ) {
+                    Ok((wire_b64, raw_len, wire_len)) => {
+                        if full_canary {
+                            last_canary_epoch = active.epoch;
+                        }
                         let rig_macs: f64 = telemetry_pf.read().unwrap().gpus.iter().map(|g| g.hashrate_macs).sum();
                         let _ = share_tx.send(VerifiedShare {
                             gpu_ordinal: cand.gpu_ordinal,
@@ -684,45 +747,81 @@ fn main() -> Result<()> {
         });
     }
 
-    // Spawn 1 dedicated worker thread per GPU
+    // Spawn 1 dedicated zero-bubble async ping-pong worker thread per GPU
     let mut worker_handles = Vec::with_capacity(engines.len());
     for (slot_i, mut eng) in engines {
         let sj = shared_job.clone();
+        let pj_ref = pending_job.clone();
         let gn = global_nonce.clone();
         let tx = hit_tx.clone();
         let tel = telemetry.clone();
         let handle = thread::spawn(move || {
             let mut loaded_epoch = 1u32;
             let mut ema_macs = 0.0f64;
+            let mut cached_sens = eng.sensors();
+            let mut last_sens_at = Instant::now();
             while !STOP_SIGNAL.load(Ordering::Relaxed) {
+                let (pend_ep, pend_job) = { pj_ref.read().unwrap().clone() };
+                if slot_i == 0 && pend_ep != loaded_epoch {
+                    match eng.prepare_job(&pend_job, pend_ep) {
+                        Ok(cache) => {
+                            *sj.write().unwrap() = Some(Arc::new(SharedActiveJob {
+                                epoch: pend_ep,
+                                job: pend_job,
+                                cache,
+                            }));
+                            loaded_epoch = pend_ep;
+                        }
+                        Err(e) => {
+                            eprintln!("[gpu #{}] prepare_job error: {e:#}", eng.info.ordinal);
+                            thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
+                    }
+                }
+
                 let active = { sj.read().unwrap().clone() };
                 let Some(act) = active else {
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(1));
                     continue;
                 };
+                if act.epoch != pend_ep {
+                    // Secondary GPU (`slot_i > 0`) waiting ~2 ms for GPU #0 to publish the new block's Merkle cache
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 if act.epoch != loaded_epoch {
-                    if let Err(e) = eng.prepare_job(&act.job, act.epoch) {
-                        eprintln!("[gpu #{}] prepare_job error: {e:#}", eng.info.ordinal);
+                    if let Err(e) = eng.load_job_with_cache(&act.job, &act.cache, act.epoch) {
+                        eprintln!("[gpu #{}] load_job_with_cache error: {e:#}", eng.info.ordinal);
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     loaded_epoch = act.epoch;
                 }
 
-                let nonce = gn.fetch_add(1, Ordering::Relaxed);
-                match eng.mine_round(&act.job, &act.cache, nonce, act.epoch, eng.active_variant, true) {
-                    Ok(out) => {
+                let active_var = eng.active_variant;
+                match eng.mine_round_pipelined(
+                    &act.job,
+                    &act.cache,
+                    &mut || gn.fetch_add(1, Ordering::Relaxed),
+                    act.epoch,
+                    active_var,
+                ) {
+                    Ok((nonce, out)) => {
                         if !out.aborted {
                             let sec = ((out.round_ms as f64) * 1e-3).max(1e-6);
                             let inst_macs = eng.profile.macs_per_round() / sec;
                             ema_macs = if ema_macs == 0.0 { inst_macs } else { ema_macs * 0.8 + inst_macs * 0.2 };
-                            let sens = eng.sensors();
+                            if last_sens_at.elapsed() >= Duration::from_secs(5) {
+                                last_sens_at = Instant::now();
+                                cached_sens = eng.sensors();
+                            }
                             {
                                 let mut t = tel.write().unwrap();
                                 if let Some(gs) = t.gpus.get_mut(slot_i) {
-                                    gs.variant = eng.variant_name(eng.active_variant).to_string();
+                                    gs.variant = eng.variant_name(active_var).to_string();
                                     gs.hashrate_macs = ema_macs;
-                                    gs.sensors = TelemetrySensors::from(sens);
+                                    gs.sensors = TelemetrySensors::from(cached_sens);
                                 }
                             }
                             for grp in out.hit_groups {
@@ -738,17 +837,19 @@ fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
+                        let _ = eng.flush_pipeline();
                         eprintln!("[gpu #{}] mine_round error: {e:#}", eng.info.ordinal);
                         thread::sleep(Duration::from_millis(200));
                     }
                 }
             }
+            let _ = eng.flush_pipeline();
         });
         worker_handles.push(handle);
     }
     drop(hit_tx);
 
-    // Helper to trigger instant < 0.2 ms preemption across all GPUs on new block!
+    // Helper to trigger instant preemption across all GPUs on new block!
     let broadcast_epoch = |ep: u32| {
         global_epoch.store(ep, Ordering::Release);
         for &ptr_u in &abort_ptrs_usize {
@@ -757,11 +858,6 @@ fn main() -> Result<()> {
         }
     };
 
-    // Build a tiny helper CPU/GPU cache builder for new jobs?
-    // Even simpler & faster: on new job, build Constant64MerkleCache::build_cpu in parallel via Rayon
-    // OR note that each GPU worker's `eng.prepare_job` ALREADY builds `d_bas_b` in 1.2 ms — wait:
-    // `Constant64MerkleCache::build_cpu` at M=32768, K=16384 hashes 524k leaves (~40 ms on 8-core CPU),
-    // or we can build it right there so `shared_job` has the cache immediately while GPUs abort in 0.2 ms!
     let mut last_log = Instant::now();
 
     while !STOP_SIGNAL.load(Ordering::SeqCst) {
@@ -791,22 +887,15 @@ fn main() -> Result<()> {
                 for ev in events {
                     match ev {
                         StratumEvent::NewJob(notify) => {
-                            let new_ep = global_epoch.load(Ordering::Relaxed).wrapping_add(1).max(1);
-                            // Preempt all GPUs in < 0.25 ms immediately!
-                            broadcast_epoch(new_ep);
-                            match PreparedJob::new(notify.clone(), profile)
-                                .and_then(|pj| Constant64MerkleCache::build_cpu(&pj).map(|c| (pj, c)))
-                            {
-                                Ok((pj, cache)) => {
+                            match PreparedJob::new(notify.clone(), profile) {
+                                Ok(pj) => {
+                                    let new_ep = global_epoch.load(Ordering::Relaxed).wrapping_add(1).max(1);
                                     println!(
                                         "[job] New work: id={} height={} cert_v={}",
                                         notify.job_id, notify.height, notify.cert_version
                                     );
-                                    *shared_job.write().unwrap() = Some(Arc::new(SharedActiveJob {
-                                        epoch: new_ep,
-                                        job: pj,
-                                        cache,
-                                    }));
+                                    *pending_job.write().unwrap() = (new_ep, pj);
+                                    broadcast_epoch(new_ep);
                                 }
                                 Err(e) => eprintln!("[job] Invalid pool job ignored: {e:#}"),
                             }
@@ -846,16 +935,10 @@ fn main() -> Result<()> {
                         Ok(new_sess) => {
                             use_gzip_flag.store(new_sess.gzip_v2, Ordering::Relaxed);
                             if let Some(notify) = new_sess.current_job.clone() {
-                                let new_ep = global_epoch.load(Ordering::Relaxed).wrapping_add(1).max(1);
-                                broadcast_epoch(new_ep);
-                                if let Ok((pj, cache)) = PreparedJob::new(notify, profile)
-                                    .and_then(|pj| Constant64MerkleCache::build_cpu(&pj).map(|c| (pj, c)))
-                                {
-                                    *shared_job.write().unwrap() = Some(Arc::new(SharedActiveJob {
-                                        epoch: new_ep,
-                                        job: pj,
-                                        cache,
-                                    }));
+                                if let Ok(pj) = PreparedJob::new(notify, profile) {
+                                    let new_ep = global_epoch.load(Ordering::Relaxed).wrapping_add(1).max(1);
+                                    *pending_job.write().unwrap() = (new_ep, pj);
+                                    broadcast_epoch(new_ep);
                                 }
                             }
                             {
