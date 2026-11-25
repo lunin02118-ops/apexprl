@@ -8,8 +8,11 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/root/apexprl-target}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-echo "=== [1/4] Auditing CUDA SASS Kernels (v0.5 Basis-128 + EDCP-120 + Direct-L2 + Legacy Basis-160; SM89 & SM120a) ==="
+echo "=== [1/4] Auditing CUDA SASS Kernels (v0.7 Strassen-24K + Basis-128 + EDCP-120 + Direct-L2 + Basis-160; SM89 & SM120a) ==="
 mkdir -p /root/apexprl-cubins
+nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_89   -Xptxas -O3,-v --cubin kernels/apexprl_strassen_sm89.cu   -o /root/apexprl-cubins/apexprl_strassen_sm89.cubin
+nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_120a -Xptxas -O3,-v --cubin kernels/apexprl_strassen_sm120a.cu -o /root/apexprl-cubins/apexprl_strassen_sm120a_raw.cubin
+python3 tools/opt_strassen_sm120.py /root/apexprl-cubins/apexprl_strassen_sm120a_raw.cubin /root/apexprl-cubins/apexprl_strassen_sm120a.cubin apx_strassen_mine_v0
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_89   -Xptxas -O1,-v --cubin kernels/apexprl_b128_sm89.cu     -o /root/apexprl-cubins/apexprl_b128_sm89.cubin
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_120a -Xptxas -O1,-v --cubin kernels/apexprl_b128_sm120a.cu   -o /root/apexprl-cubins/apexprl_b128_sm120a.cubin
 nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_89   -Xptxas -O3,-v --cubin kernels/apexprl_edcp_sm89.cu     -o /root/apexprl-cubins/apexprl_edcp_sm89.cubin
@@ -21,7 +24,7 @@ nvcc -O3 -std=c++20 --expt-relaxed-constexpr -diag-suppress 177,549 -arch=sm_120
 python3 tools/check_sass.py /root/apexprl-cubins
 
 echo "=== [2/4] Building Portable HiveOS Binary (x86_64-unknown-linux-gnu.2.31) ==="
-cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31 -p apexprl-cli
+APX_STRASSEN_SM120_CUBIN=/root/apexprl-cubins/apexprl_strassen_sm120a.cubin cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31 -p apexprl-cli
 
 BIN_PATH="${CARGO_TARGET_DIR}/x86_64-unknown-linux-gnu/release/apexprl"
 echo "=== [3/4] Auditing Dynamic Symbols & GLIBC Compatibility ==="

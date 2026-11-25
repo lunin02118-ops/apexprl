@@ -25,6 +25,8 @@ const _: () = assert!(std::mem::size_of::<EdcpColSpec>() == 4);
 
 const CUBIN_B128_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_b128_sm89.cubin"));
 const CUBIN_B128_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_b128_sm120a.cubin"));
+const CUBIN_STRASSEN_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_strassen_sm89.cubin"));
+const CUBIN_STRASSEN_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_strassen_sm120a.cubin"));
 const CUBIN_DIRECT_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_direct_sm89.cubin"));
 const CUBIN_DIRECT_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_direct_sm120a.cubin"));
 const CUBIN_EDCP_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_edcp_sm89.cubin"));
@@ -32,12 +34,15 @@ const CUBIN_EDCP_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexp
 const CUBIN_BASIS_SM89: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_sm89.cubin"));
 const CUBIN_BASIS_SM120A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/apexprl_sm120a.cubin"));
 
+pub const SMEM_STRASSEN_BYTES: c_int = 98432; // 16KiB A + 32KiB B + 2*24KiB RAW-24K Strassen slots + 128B bar
 pub const SMEM_BASIS128_BYTES: c_int = 90240; // 16KiB A + 32KiB B + 2*12KiB stage + 16KiB trace + 128B bar
 pub const SMEM_BASIS_BYTES: c_int = 96320;
 pub const SMEM_DIRECT_2CTA_BYTES: c_int = 41088; // 2 * 16384 + 8192 + 128 (x2 CTAs/SM = 82,176 B <= 99 KiB)
 pub const SMEM_DIRECT_3STG_BYTES: c_int = 90240; // 3 * 24576 + 16384 + 128
 pub const SMEM_EDCP_2CTA_BYTES: c_int = 39040; // 16384 + 14336 + 8192 + 128 (x2 CTAs/SM = 78,080 B <= 99 KiB)
 
+pub const VARIANT_NAMES_STRASSEN_ADA: [&str; 1] = ["ada-strassen24k-v0"];
+pub const VARIANT_NAMES_STRASSEN_BW: [&str; 1] = ["bw-strassen24k-v0"];
 pub const VARIANT_NAMES_B128_ADA: [&str; 4] = ["ada128-e2", "ada128-e1", "ada128-c6", "ada128-c9"];
 pub const VARIANT_NAMES_B128_BW: [&str; 4] = ["bw128-e2", "bw128-c9", "bw128-c8", "bw128-c0"];
 pub const VARIANT_NAMES_DIRECT_ADA: [&str; 3] = ["hl2-2cta", "hl2-2cta-s2", "hl2-3stg"];
@@ -49,6 +54,7 @@ pub const VARIANT_NAMES_BASIS_BW: [&str; 4] = ["bw-u6", "bw-y5m1", "bw-w5q21", "
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineKind {
+    Strassen,
     Basis128,
     Basis160,
     DirectL2,
@@ -454,6 +460,7 @@ enum EngineBackend {
         fn_reorder_pairs: CUfunction,
         fn_variants: [CUfunction; 4],
         smem_bytes: c_int,
+        trace_offset: Option<u64>,
         d_bpairs: DevMem,
         d_pairs: DevMem,
         d_pairs_alt: DevMem,
@@ -553,7 +560,9 @@ impl GpuWorkerEngine {
             info.sm_minor
         );
 
-        let engine_kind = if profile.is_edcp() {
+        let engine_kind = if profile.is_strassen() {
+            EngineKind::Strassen
+        } else if profile.is_edcp() {
             EngineKind::Edcp120
         } else if profile.is_direct_l2() {
             EngineKind::DirectL2
@@ -586,7 +595,12 @@ impl GpuWorkerEngine {
         let d_target_le = DevMem::alloc(api, 32)?;
         let bas_a_bytes = profile.m * 128;
         let bas_b_bytes = profile.n * 128;
-        let d_bas_ab = DevMem::alloc(api, bas_a_bytes + bas_b_bytes)?;
+        let trace_bytes = if engine_kind == EngineKind::Strassen {
+            (info.sm_count.max(1) as usize) * 16384
+        } else {
+            0
+        };
+        let d_bas_ab = DevMem::alloc(api, bas_a_bytes + bas_b_bytes + trace_bytes)?;
         let bas_b_offset = bas_a_bytes as u64;
         let d_tree = DevMem::alloc(api, Constant64MerkleCache::heap_byte_len(&profile))?;
         let ctrl = MappedControlPage::alloc(api, hit_cap)?;
@@ -706,20 +720,29 @@ impl GpuWorkerEngine {
                     panel_m_tiles,
                 }
             }
-            EngineKind::Basis128 | EngineKind::Basis160 => {
+            EngineKind::Strassen | EngineKind::Basis128 | EngineKind::Basis160 => {
+                let is_strassen = engine_kind == EngineKind::Strassen;
                 let is_b128 = engine_kind == EngineKind::Basis128;
-                l2_pinned_bytes = pin_l2_window(api, dev, stream, d_bas_ab.ptr, bas_a_bytes + bas_b_bytes);
-                let cubin = match (is_b128, info.is_blackwell()) {
-                    (true, true) => CUBIN_B128_SM120A,
-                    (true, false) => CUBIN_B128_SM89,
-                    (false, true) => CUBIN_BASIS_SM120A,
-                    (false, false) => CUBIN_BASIS_SM89,
+                l2_pinned_bytes = pin_l2_window(api, dev, stream, d_bas_ab.ptr, bas_a_bytes + bas_b_bytes + trace_bytes);
+                let cubin = match (engine_kind, info.is_blackwell()) {
+                    (EngineKind::Strassen, true) => CUBIN_STRASSEN_SM120A,
+                    (EngineKind::Strassen, false) => CUBIN_STRASSEN_SM89,
+                    (EngineKind::Basis128, true) => CUBIN_B128_SM120A,
+                    (EngineKind::Basis128, false) => CUBIN_B128_SM89,
+                    (_, true) => CUBIN_BASIS_SM120A,
+                    (_, false) => CUBIN_BASIS_SM89,
                 };
                 let mut module = std::ptr::null_mut();
                 check_cu(
                     api,
                     unsafe { (api.cuModuleLoadData)(&mut module, cubin.as_ptr() as *const c_void) },
-                    if is_b128 { "cuModuleLoadData(basis128)" } else { "cuModuleLoadData(basis160)" },
+                    if is_strassen {
+                        "cuModuleLoadData(strassen)"
+                    } else if is_b128 {
+                        "cuModuleLoadData(basis128)"
+                    } else {
+                        "cuModuleLoadData(basis160)"
+                    },
                 )?;
                 let get_fn = |name: &str| -> Result<CUfunction> {
                     let cs = CString::new(name).unwrap();
@@ -727,27 +750,46 @@ impl GpuWorkerEngine {
                     check_cu(api, unsafe { (api.cuModuleGetFunction)(&mut f, module, cs.as_ptr()) }, name)?;
                     Ok(f)
                 };
-                let fn_merkle_leaves = get_fn("apx_merkle_leaves_const64")?;
+                let fn_merkle_leaves = get_fn(if is_strassen {
+                    "apx_merkle_leaves_const0"
+                } else {
+                    "apx_merkle_leaves_const64"
+                })?;
                 let fn_merkle_parents = get_fn("apx_merkle_parents")?;
                 let fn_gen_basis = get_fn("apx_gen_basis_arch")?;
                 let fn_gen_b_pairs = get_fn("apx_gen_b_pairs")?;
-                let fn_gen_ab_pairs = get_fn("apx_gen_ab_pairs_from_b")?;
+                let fn_gen_ab_pairs = get_fn(if is_strassen {
+                    "apx_gen_ab_pairs_soa"
+                } else {
+                    "apx_gen_ab_pairs_from_b"
+                })?;
                 let fn_reorder_pairs = get_fn("apx_reorder_pairs_arch")?;
-                let prefix = if is_b128 { "apx_b128_mine" } else { "apx_basis_mine" };
-                let fn_variants = [
-                    get_fn(&format!("{prefix}_v0"))?,
-                    get_fn(&format!("{prefix}_v1"))?,
-                    get_fn(&format!("{prefix}_v2"))?,
-                    get_fn(&format!("{prefix}_v3"))?,
-                ];
-                let smem_bytes = if is_b128 { SMEM_BASIS128_BYTES } else { SMEM_BASIS_BYTES };
+                let (fn_variants, smem_bytes) = if is_strassen {
+                    let fv = get_fn("apx_strassen_mine_v0")?;
+                    ([fv, fv, fv, fv], SMEM_STRASSEN_BYTES)
+                } else {
+                    let prefix = if is_b128 { "apx_b128_mine" } else { "apx_basis_mine" };
+                    let fvs = [
+                        get_fn(&format!("{prefix}_v0"))?,
+                        get_fn(&format!("{prefix}_v1"))?,
+                        get_fn(&format!("{prefix}_v2"))?,
+                        get_fn(&format!("{prefix}_v3"))?,
+                    ];
+                    (fvs, if is_b128 { SMEM_BASIS128_BYTES } else { SMEM_BASIS_BYTES })
+                };
                 for &f in &fn_variants {
                     check_cu(api, unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_bytes) }, "smem(basis)")?;
                     let _ = unsafe { (api.cuFuncSetAttribute)(f, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100) };
                 }
+                let trace_offset = if is_strassen {
+                    Some((bas_a_bytes + bas_b_bytes) as u64)
+                } else {
+                    None
+                };
+                let pairs_bytes = if is_strassen { (profile.k + 64) * 8 } else { profile.k * 8 };
                 let d_bpairs = DevMem::alloc(api, profile.k * 4)?;
-                let d_pairs = DevMem::alloc(api, profile.k * 8)?;
-                let d_pairs_alt = DevMem::alloc(api, profile.k * 8)?;
+                let d_pairs = DevMem::alloc(api, pairs_bytes)?;
+                let d_pairs_alt = DevMem::alloc(api, pairs_bytes)?;
                 let d_key_a_alt = DevMem::alloc(api, 32)?;
                 let ctrl_alt = MappedControlPage::alloc(api, hit_cap)?;
                 let mut ev_alt_round_start = std::ptr::null_mut();
@@ -766,6 +808,7 @@ impl GpuWorkerEngine {
                     fn_reorder_pairs,
                     fn_variants,
                     smem_bytes,
+                    trace_offset,
                     d_bpairs,
                     d_pairs,
                     d_pairs_alt,
@@ -820,6 +863,7 @@ impl GpuWorkerEngine {
 
     pub fn num_variants(&self) -> usize {
         match self.engine_kind {
+            EngineKind::Strassen => 1,
             EngineKind::DirectL2 => 3,
             EngineKind::Edcp120 => 2,
             EngineKind::Basis128 | EngineKind::Basis160 => 4,
@@ -828,6 +872,13 @@ impl GpuWorkerEngine {
 
     pub fn variant_name(&self, idx: usize) -> &'static str {
         match self.engine_kind {
+            EngineKind::Strassen => {
+                if self.info.is_blackwell() {
+                    VARIANT_NAMES_STRASSEN_BW[0]
+                } else {
+                    VARIANT_NAMES_STRASSEN_ADA[0]
+                }
+            }
             EngineKind::DirectL2 => {
                 if self.info.is_blackwell() {
                     VARIANT_NAMES_DIRECT_BW[idx % 3]
@@ -895,15 +946,20 @@ impl GpuWorkerEngine {
                     panel_m_tiles
                 )
             }
-            EngineBackend::Basis { .. } => {
-                let tag = if self.engine_kind == EngineKind::Basis128 {
-                    "Uniform-3 v0.5 Persistent-A Basis-128x256"
-                } else {
-                    "Legacy Basis-160x256"
+            EngineBackend::Basis { trace_offset, .. } => {
+                let tag = match self.engine_kind {
+                    EngineKind::Strassen => "RAW-24K Basis-Strassen <2,2,2:7> v0.7 (Constant-0)",
+                    EngineKind::Basis128 => "Uniform-3 v0.5 Persistent-A Basis-128x256",
+                    _ => "Legacy Basis-160x256",
                 };
-                let bas_mib = ((self.profile.m + self.profile.n) * 128) as f64 / 1048576.0;
+                let extra_mib = if trace_offset.is_some() {
+                    ((self.info.sm_count.max(1) as usize) * 16384) as f64 / 1048576.0
+                } else {
+                    0.0
+                };
+                let bas_mib = ((self.profile.m + self.profile.n) * 128) as f64 / 1048576.0 + extra_mib;
                 format!(
-                    "{tag} ({}x{}x{}, L2 basis={:.2}MiB, L2pin={:.2}MiB in {:.0}MiB L2)",
+                    "{tag} ({}x{}x{}, L2 working={:.2}MiB, L2pin={:.2}MiB in {:.0}MiB L2)",
                     self.profile.sampled_m(),
                     self.profile.n,
                     self.profile.k,
@@ -1282,6 +1338,7 @@ impl GpuWorkerEngine {
             fn_reorder_pairs,
             fn_variants,
             smem_bytes,
+            trace_offset,
             d_bpairs,
             d_pairs,
             d_pairs_alt,
@@ -1413,22 +1470,47 @@ impl GpuWorkerEngine {
             abort_epoch_ptr: abort_dev_ptr,
             expected_epoch: epoch,
         };
-        let mut launch_args: [*mut c_void; 1] = [(&mut kparams as *mut ApxBasisParams).cast()];
-        check_cu(
-            api,
-            unsafe {
-                (api.cuLaunchKernel)(
-                    fn_variants[variant_idx % 4],
-                    self.info.sm_count as c_uint, 1, 1,
-                    256, 1, 1,
-                    *smem_bytes as c_uint,
-                    self.stream,
-                    launch_args.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                )
-            },
-            v_name,
-        )?;
+        if let Some(t_off) = *trace_offset {
+            let mut pairs_b_ptr = p_pairs + ((self.profile.k + 64) * 4) as u64;
+            let mut trace_ptr = self.d_bas_ab.ptr + t_off;
+            let mut launch_args: [*mut c_void; 3] = [
+                (&mut kparams as *mut ApxBasisParams).cast(),
+                (&mut pairs_b_ptr as *mut CUdeviceptr).cast(),
+                (&mut trace_ptr as *mut CUdeviceptr).cast(),
+            ];
+            check_cu(
+                api,
+                unsafe {
+                    (api.cuLaunchKernel)(
+                        fn_variants[0],
+                        self.info.sm_count as c_uint, 1, 1,
+                        256, 1, 1,
+                        *smem_bytes as c_uint,
+                        self.stream,
+                        launch_args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                v_name,
+            )?;
+        } else {
+            let mut launch_args: [*mut c_void; 1] = [(&mut kparams as *mut ApxBasisParams).cast()];
+            check_cu(
+                api,
+                unsafe {
+                    (api.cuLaunchKernel)(
+                        fn_variants[variant_idx % 4],
+                        self.info.sm_count as c_uint, 1, 1,
+                        256, 1, 1,
+                        *smem_bytes as c_uint,
+                        self.stream,
+                        launch_args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                v_name,
+            )?;
+        }
 
         check_cu(api, unsafe { (api.cuEventRecord)(ev_k1, self.stream) }, "cuEventRecord(slot_end)")?;
         Ok(())
@@ -1944,6 +2026,7 @@ impl GpuWorkerEngine {
                 fn_reorder_pairs,
                 fn_variants,
                 smem_bytes,
+                trace_offset,
                 d_bpairs,
                 d_pairs,
                 ..
@@ -2040,22 +2123,47 @@ impl GpuWorkerEngine {
                     abort_epoch_ptr: self.ctrl.dev_abort_ptr(),
                     expected_epoch: epoch,
                 };
-                let mut launch_args: [*mut c_void; 1] = [(&mut kparams as *mut ApxBasisParams).cast()];
-                check_cu(
-                    api,
-                    unsafe {
-                        (api.cuLaunchKernel)(
-                            fn_variants[variant_idx % 4],
-                            self.info.sm_count as c_uint, 1, 1,
-                            256, 1, 1,
-                            *smem_bytes as c_uint,
-                            self.stream,
-                            launch_args.as_mut_ptr(),
-                            std::ptr::null_mut(),
-                        )
-                    },
-                    self.variant_name(variant_idx),
-                )?;
+                if let Some(t_off) = *trace_offset {
+                    let mut pairs_b_ptr = d_pairs.ptr + ((self.profile.k + 64) * 4) as u64;
+                    let mut trace_ptr = self.d_bas_ab.ptr + t_off;
+                    let mut launch_args: [*mut c_void; 3] = [
+                        (&mut kparams as *mut ApxBasisParams).cast(),
+                        (&mut pairs_b_ptr as *mut CUdeviceptr).cast(),
+                        (&mut trace_ptr as *mut CUdeviceptr).cast(),
+                    ];
+                    check_cu(
+                        api,
+                        unsafe {
+                            (api.cuLaunchKernel)(
+                                fn_variants[0],
+                                self.info.sm_count as c_uint, 1, 1,
+                                256, 1, 1,
+                                *smem_bytes as c_uint,
+                                self.stream,
+                                launch_args.as_mut_ptr(),
+                                std::ptr::null_mut(),
+                            )
+                        },
+                        self.variant_name(variant_idx),
+                    )?;
+                } else {
+                    let mut launch_args: [*mut c_void; 1] = [(&mut kparams as *mut ApxBasisParams).cast()];
+                    check_cu(
+                        api,
+                        unsafe {
+                            (api.cuLaunchKernel)(
+                                fn_variants[variant_idx % 4],
+                                self.info.sm_count as c_uint, 1, 1,
+                                256, 1, 1,
+                                *smem_bytes as c_uint,
+                                self.stream,
+                                launch_args.as_mut_ptr(),
+                                std::ptr::null_mut(),
+                            )
+                        },
+                        self.variant_name(variant_idx),
+                    )?;
+                }
 
                 check_cu(api, unsafe { (api.cuEventRecord)(self.ev_end, self.stream) }, "cuEventRecord(end)")?;
                 check_cu(api, unsafe { (api.cuEventSynchronize)(self.ev_end) }, "cuEventSynchronize")?;

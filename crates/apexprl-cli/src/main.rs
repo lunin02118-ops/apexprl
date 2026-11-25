@@ -59,11 +59,11 @@ struct Cli {
     #[arg(long, visible_alias = "password", default_value = "auto")]
     pass: String,
 
-    /// Compute engine (`basis128` = v0.4 Wavefront-Exact 2-Opt 128x256 [default], `direct` = v0.4 Zero-Eviction L2 2-CTA/SM, `edcp` = v0.4 Zero-Outlier Cycle-Packing K<=120, `basis160` = v0.1)
-    #[arg(long, default_value = "basis128")]
+    /// Compute engine (`auto` = Strassen-24K on RTX 50 Blackwell / Basis-128 on RTX 40 Ada [default], `strassen` = v0.7 RAW-24K Basis-Strassen <2,2,2:7> Constant-0, `basis128` = v0.5 Wavefront-Exact 2-Opt 128x256, `direct` = Hyper-L2 2-CTA/SM, `edcp` = EDCP-120, `basis160` = v0.1)
+    #[arg(long, default_value = "auto")]
     engine: String,
 
-    /// Inner matrix dimension K (defaults: `65536` for `basis128` on gzip-v2, `16384` for `basis160`, `2048` for `direct`/`edcp`)
+    /// Inner matrix dimension K (defaults: `65536` for `strassen`/`basis128` on gzip-v2, `16384` for `basis160`, `2048` for `direct`/`edcp`)
     #[arg(long)]
     k: Option<usize>,
 
@@ -162,18 +162,37 @@ fn select_gpus(filter: Option<&str>) -> Result<Vec<GpuDeviceInfo>> {
     }
 }
 
-fn parse_engine(raw: &str) -> Result<EngineKind> {
+fn parse_engine(raw: &str, gpus: &[GpuDeviceInfo]) -> Result<EngineKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => {
+            if !gpus.is_empty() && gpus.iter().all(|g| g.is_blackwell()) {
+                Ok(EngineKind::Strassen)
+            } else {
+                Ok(EngineKind::Basis128)
+            }
+        }
+        "strassen" | "strassen24k" | "raw24k" | "s24k" => Ok(EngineKind::Strassen),
         "basis128" | "b128" | "uniform3" | "u3" => Ok(EngineKind::Basis128),
         "basis160" | "basis" | "legacy" => Ok(EngineKind::Basis160),
         "direct" | "hyper-l2" | "hl2" | "l2" => Ok(EngineKind::DirectL2),
         "edcp" | "edcp120" | "k120" | "cycle" | "forest" => Ok(EngineKind::Edcp120),
-        other => anyhow::bail!("Unsupported --engine '{other}'; expected 'basis128', 'direct', 'edcp', or 'basis160'"),
+        other => anyhow::bail!("Unsupported --engine '{other}'; expected 'auto', 'strassen', 'basis128', 'direct', 'edcp', or 'basis160'"),
     }
 }
 
 fn build_profile(gpus: &[GpuDeviceInfo], engine: EngineKind, k_opt: Option<usize>, gzip_v2: bool) -> Result<KernelProfile> {
     match engine {
+        EngineKind::Strassen => {
+            let raw_k = k_opt.unwrap_or(65536);
+            let active_k = if !gzip_v2 && raw_k > 4096 {
+                println!("[stratum] Pool did not negotiate gzip-v2; stepping K={raw_k} -> 4096 to fit plain proof limit");
+                4096
+            } else {
+                raw_k
+            };
+            let sm_counts: Vec<usize> = gpus.iter().map(|g| g.sm_count.max(1) as usize).collect();
+            KernelProfile::strassen_128x256_sm_aligned(&sm_counts, active_k)
+        }
         EngineKind::Basis128 => {
             let raw_k = k_opt.unwrap_or(65536);
             let active_k = if !gzip_v2 && raw_k > 4096 {
@@ -325,22 +344,25 @@ fn verify_selftest_profile(gpus: &[GpuDeviceInfo], cli: &Cli, label: &str, profi
 /// 3. Cross-checks GPU hit digests against exact CPU `cpu_eval_group_digest`.
 /// 4. Verifies full `PlainProof` via official `zk-pow::verify_plain_proof` V3 + `gzip`!
 fn run_hardware_selftest(gpus: &[GpuDeviceInfo], cli: &Cli) -> Result<()> {
-    println!("[selftest] Starting quad-engine hardware + zk-pow V3 verification across {} GPU(s)...", gpus.len());
-    // 1. v0.5 Persistent-A Unpredicated Basis-128x256 (power-of-two AND SM-aligned odd-leaf M < N! K=4096 exercises rotl_xor<13>)
+    println!("[selftest] Starting 5-engine hardware + zk-pow V3 verification across {} GPU(s)...", gpus.len());
+    // 1. v0.7 On-Chip RAW-24K Basis-Strassen <2,2,2:7> Constant-0 (power-of-two AND SM-aligned odd-leaf M < N; K=4096 exercises rotl_xor<13>)
+    verify_selftest_profile(gpus, cli, "strassen-24k", KernelProfile::with_dims_strassen_128x256(1024, 1024, 4096)?)?;
+    verify_selftest_profile(gpus, cli, "strassen-24k-sm", KernelProfile::with_dims_strassen_128x256(400, 512, 4096)?)?;
+    // 2. v0.5 Persistent-A Unpredicated Basis-128x256 (power-of-two AND SM-aligned odd-leaf M < N! K=4096 exercises rotl_xor<13>)
     verify_selftest_profile(gpus, cli, "basis-128", KernelProfile::with_dims_128x256(1024, 1024, 4096)?)?;
     verify_selftest_profile(gpus, cli, "basis-128-sm", KernelProfile::with_dims_128x256(400, 512, 4096)?)?;
-    // 2. v0.4 Zero-Outlier EDCP-120 Cycle-Packing (Constant-0 + b_salt, K=2048)
+    // 3. v0.4 Zero-Outlier EDCP-120 Cycle-Packing (Constant-0 + b_salt, K=2048)
     verify_selftest_profile(gpus, cli, "edcp-120", KernelProfile::edcp_120(1024, 512, 2048)?)?;
-    // 3. v0.4 Zero-Eviction Hyper-L2 Direct rectangular M > N
+    // 4. v0.4 Zero-Eviction Hyper-L2 Direct rectangular M > N
     verify_selftest_profile(gpus, cli, "direct-l2", KernelProfile::direct_l2_128x128(1024, 512, 2048)?)?;
-    // 4. v0.1 Legacy Basis-160x256
+    // 5. v0.1 Legacy Basis-160x256
     verify_selftest_profile(gpus, cli, "basis-160", KernelProfile::with_dims(1024, 1024, 2048)?)?;
-    println!("[selftest] ALL CHECKS PASSED (BIT-EXACT GPU == CPU == ZK-POW V3 FOR ALL 4 ENGINES)!");
+    println!("[selftest] ALL CHECKS PASSED (BIT-EXACT GPU == CPU == ZK-POW V3 FOR ALL 5 ENGINES)!");
     Ok(())
 }
 
 fn run_offline_benchmark(gpus: &[GpuDeviceInfo], cli: &Cli, seconds: u64) -> Result<()> {
-    let engine = parse_engine(&cli.engine)?;
+    let engine = parse_engine(&cli.engine, gpus)?;
     let profile = build_profile(gpus, engine, cli.k, true)?;
     println!(
         "[bench] ApexPRL v{} Benchmark [engine={}]: M={} (sampled {}), N={}, K={} ({:.2} TMAC/round) for {}s...",
@@ -535,7 +557,7 @@ fn main() -> Result<()> {
         !cli.wallet.trim().is_empty(),
         "Missing --wallet <KRX_ID_OR_PRL_ADDR> (or run with --self-test / --benchmark 10)"
     );
-    let _ = parse_engine(&cli.engine)?;
+    let _ = parse_engine(&cli.engine, &gpus)?;
 
     let pools = if cli.pools.is_empty() {
         vec![
@@ -605,10 +627,11 @@ fn main() -> Result<()> {
         }
     };
 
-    let engine = parse_engine(&cli.engine)?;
+    let engine = parse_engine(&cli.engine, &gpus)?;
     let profile = build_profile(&gpus, engine, cli.k, session.gzip_v2)?;
     let active_k = profile.k;
     let engine_tag = match engine {
+        EngineKind::Strassen => "strassen24k",
         EngineKind::Basis128 => "b128",
         EngineKind::Basis160 => "b160",
         EngineKind::DirectL2 => "direct",
@@ -652,7 +675,7 @@ fn main() -> Result<()> {
         }
         let cache_ref = first_cache.as_ref().unwrap();
         let tune_key = format!(
-            "v05_{}_{}_sm{}{}_n{}_k{}",
+            "v07_{}_{}_sm{}{}_n{}_k{}",
             engine_tag, info.name, info.sm_major, info.sm_minor, profile.n, active_k
         );
         if let Some(&cached_v) = tune_db.entries.get(&tune_key) {

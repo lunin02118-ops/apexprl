@@ -53,7 +53,10 @@ def check_cubin(
 
 def main() -> None:
     cubin_dir = Path(sys.argv[1])
-    # v0.5 Persistent-A Unpredicated Basis-128x256 (DEFAULT): STRICT 0 spills, STRICT 0 BRX, 0 inner-loop WARPSYNC!
+    # v0.7 On-Chip RAW-24K Basis-Strassen <2,2,2:7> (SM120a Blackwell default: STRICT 0 spills, STRICT 0 BRX, TMA!)
+    check_cubin(cubin_dir / "apexprl_strassen_sm120a.cubin", expect_tma=True, max_spills=0, max_brx=0)
+    check_cubin(cubin_dir / "apexprl_strassen_sm89.cubin", expect_tma=False, max_spills=32, max_brx=0)
+    # v0.5 Persistent-A Unpredicated Basis-128x256 (Ada default): STRICT 0 spills, STRICT 0 BRX, 0 inner-loop WARPSYNC!
     check_cubin(cubin_dir / "apexprl_b128_sm89.cubin", expect_tma=False, max_spills=0, max_warpsync=12, max_brx=0)
     check_cubin(cubin_dir / "apexprl_b128_sm120a.cubin", expect_tma=True, max_spills=0, max_warpsync=24, max_brx=0)
     # v0.5 Zero-Outlier EDCP-120 Cycle-Packing: STRICT 0 spills, STRICT 0 BRX!
@@ -65,7 +68,7 @@ def main() -> None:
     # v0.1 legacy Basis-160x256 engines
     check_cubin(cubin_dir / "apexprl_sm89.cubin", expect_tma=False, max_spills=32)
     check_cubin(cubin_dir / "apexprl_sm120a.cubin", expect_tma=False, max_spills=32)
-    print("[SASS] ALL 8 CUBIN INVARIANTS PASSED (0 SPILLS & 0 BRX ON ALL v0.5 BASIS-128, EDCP-120 & DIRECT-L2 KERNELS)!")
+    print("[SASS] ALL 10 CUBIN INVARIANTS PASSED (0 SPILLS & 0 BRX ON SM120a STRASSEN-24K & ALL v0.5 ENGINES)!")
 
 
 if __name__ == "__main__":

@@ -28,8 +28,11 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     println!("cargo:rerun-if-changed={}", kernels_dir.display());
+    println!("cargo:rerun-if-changed={}", workspace_root.join("tools/opt_strassen_sm120.py").display());
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=CUBIT_ROOT");
+    println!("cargo:rerun-if-env-changed=APX_STRASSEN_SM120_CUBIN");
 
     let cuda_home = env::var("CUDA_HOME")
         .map(PathBuf::from)
@@ -104,4 +107,40 @@ fn main() {
         "-O1",
         &out_dir.join("apexprl_edcp_sm120a.cubin"),
     );
+
+    // v0.7 On-Chip RAW-24K Basis-Strassen <2,2,2:7> cubins (`--engine strassen`, default on SM120 Blackwell!)
+    compile_cubin(
+        &nvcc,
+        &kernels_dir.join("apexprl_strassen_sm89.cu"),
+        "sm_89",
+        "-O3",
+        &out_dir.join("apexprl_strassen_sm89.cubin"),
+    );
+    let strassen_sm120_out = out_dir.join("apexprl_strassen_sm120a.cubin");
+    if let Ok(prebuilt) = env::var("APX_STRASSEN_SM120_CUBIN") {
+        std::fs::copy(&prebuilt, &strassen_sm120_out)
+            .unwrap_or_else(|e| panic!("Failed to copy APX_STRASSEN_SM120_CUBIN ({prebuilt}): {e}"));
+    } else {
+        let strassen_sm120_raw = out_dir.join("apexprl_strassen_sm120a_raw.cubin");
+        compile_cubin(
+            &nvcc,
+            &kernels_dir.join("apexprl_strassen_sm120a.cu"),
+            "sm_120a",
+            "-O3",
+            &strassen_sm120_raw,
+        );
+        let opt_script = workspace_root.join("tools/opt_strassen_sm120.py");
+        let status = Command::new("python3")
+            .arg(&opt_script)
+            .arg(&strassen_sm120_raw)
+            .arg(&strassen_sm120_out)
+            .arg("apx_strassen_mine_v0")
+            .status()
+            .unwrap_or_else(|e| panic!("Failed to invoke python3 {}: {e}", opt_script.display()));
+        assert!(
+            status.success(),
+            "SM120 Strassen SASS optimizer/verifier failed on {}",
+            strassen_sm120_raw.display()
+        );
+    }
 }

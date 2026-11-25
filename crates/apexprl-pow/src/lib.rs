@@ -113,6 +113,21 @@ impl KernelProfile {
         })
     }
 
+    /// Creates an `SM_COUNT`-aligned Constant-0 On-Chip RAW-24K Basis-Strassen 128x256 profile
+    /// (`M = mult * SM_COUNT * 128 + 16`, `const_zero = true`, `100%` wave occupancy, `0%` discarded columns, `0 ms` b_salt search!).
+    pub fn strassen_128x256_sm_aligned(sm_counts: &[usize], k: usize) -> Result<Self> {
+        let mut p = Self::basis_128x256_sm_aligned(sm_counts, k)?;
+        p.const_zero = true;
+        Ok(p)
+    }
+
+    /// Custom matrix dimensions for Constant-0 RAW-24K Basis-Strassen 128x256 (`8x16` hash tile).
+    pub fn with_dims_strassen_128x256(m: usize, n: usize, k: usize) -> Result<Self> {
+        let mut p = Self::with_dims_128x256(m, n, k)?;
+        p.const_zero = true;
+        Ok(p)
+    }
+
     /// Creates a unified 160x256 Basis Kernel profile for `k` in {4096, 8192, 16384, 32768, 65536}.
     pub fn basis_160x256(k: usize) -> Result<Self> {
         Self::with_dims(DEFAULT_M, DEFAULT_N, k)
@@ -194,7 +209,12 @@ impl KernelProfile {
 
     #[inline]
     pub fn is_edcp(&self) -> bool {
-        self.const_zero
+        self.const_zero && self.cta_n == 128
+    }
+
+    #[inline]
+    pub fn is_strassen(&self) -> bool {
+        self.const_zero && self.cta_n == 256
     }
 
     #[inline]
@@ -226,11 +246,11 @@ impl KernelProfile {
     }
 
     /// Number of N columns actually covered by CTAs.
-    /// In `EDCP` (`Constant-0`) mode, leaves the last 256 columns (including row `n - 1` of `B^T`
-    /// where `b_salt` lives) strictly unsampled!
+    /// In `EDCP` (`Constant-0` with `b_salt`) mode, leaves the last 256 columns (including row `n - 1` of `B^T`
+    /// where `b_salt` lives) strictly unsampled! Strassen (`const_zero && cta_n == 256`) uses no `b_salt` and samples 100% of `N`.
     #[inline]
     pub fn sampled_n(&self) -> usize {
-        if self.const_zero {
+        if self.is_edcp() {
             self.n.saturating_sub(256)
         } else {
             self.n
@@ -1431,6 +1451,41 @@ mod tests {
                 U256::from_little_endian(&digest) <= bound
             })
             .expect("expected winning group in SM-aligned odd-leaf M=400, N=512 test");
+        let proof = cache.build_plain_proof(winning_grp, nonce).unwrap();
+        let (wire_gzip, raw_len, gz_len) = verify_and_encode_proof(&job, &proof, true).unwrap();
+        assert!(!wire_gzip.is_empty() && gz_len * 10 < raw_len);
+    }
+
+    #[test]
+    fn g0_strassen_24k_const0_sm_aligned_zk_pow_roundtrip() {
+        // Constant-0 RAW-24K Strassen SM-aligned odd-leaf shape (`M = 3*128 + 16 = 400`, `N = 512`, `K = 2048`):
+        // No b_salt (`edcp = None`), 100% of N sampled (`sampled_n = 512`), Constant-0 signal byte `0x00`!
+        let profile = KernelProfile::with_dims_strassen_128x256(400, 512, 2048).unwrap();
+        assert!(profile.is_strassen() && !profile.is_edcp() && profile.const_zero);
+        assert_eq!(profile.sampled_m(), 384);
+        assert_eq!(profile.sampled_n(), 512);
+        let header_hex = "01000000".to_string() + &"bc".repeat(32) + &"de".repeat(32) + "60504030" + "ffff7f20";
+        let target_hex = "000001".to_string() + &"ff".repeat(29);
+        let notify = PoolNotifyJob::from_stratum_params(&json!({
+            "job_id": "test_strassen_const0_odd_v3",
+            "header": header_hex,
+            "target": target_hex,
+            "height": 152000,
+            "cert_version": 3
+        }))
+        .unwrap();
+        let job = PreparedJob::new(notify, profile).unwrap();
+        let cache = Constant64MerkleCache::build_cpu(&job).unwrap();
+        assert!(cache.edcp.is_none());
+        let nonce = 0x2026_1125_57a5_5e00u64;
+        let (_sig, _root_a, key_a) = cache.derive_attempt(&job, nonce);
+        let bound = U256::from_little_endian(&job.bound_le);
+        let winning_grp = (0..profile.total_groups())
+            .find(|&g| {
+                let (_tr, digest) = cpu_eval_group_digest(&profile, &key_a, &cache.key_b, g);
+                U256::from_little_endian(&digest) <= bound
+            })
+            .expect("expected winning group in Strassen Constant-0 odd-leaf test");
         let proof = cache.build_plain_proof(winning_grp, nonce).unwrap();
         let (wire_gzip, raw_len, gz_len) = verify_and_encode_proof(&job, &proof, true).unwrap();
         assert!(!wire_gzip.is_empty() && gz_len * 10 < raw_len);
